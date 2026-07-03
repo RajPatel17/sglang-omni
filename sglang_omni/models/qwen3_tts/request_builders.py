@@ -14,25 +14,25 @@ import torch
 
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
+from sglang_omni.preprocessing.cache_key import (
+    reference_path_cache_key as _reference_path_cache_key,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
     new_random_sampling_seed,
 )
-from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.reference_encoder import (
     ReferenceEncodeHook,
     ReferenceEncodeKey,
     ReferenceEncodeService,
 )
+from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.speaker_cache import (
     SpeakerCacheKey,
     get_speaker_artifact_cache,
-)
-from sglang_omni.preprocessing.cache_key import (
-    hash_bytes as _hash_bytes,
-    reference_path_cache_key as _reference_path_cache_key,
 )
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
@@ -706,10 +706,7 @@ def _get_qwen3_tts_adhoc_reference_service_locked(
 ) -> ReferenceEncodeService:
     global _ADHOC_REFERENCE_SERVICE, _ADHOC_REFERENCE_SERVICE_OWNER
     owner = (id(model), id(wrapper))
-    if (
-        _ADHOC_REFERENCE_SERVICE is None
-        or _ADHOC_REFERENCE_SERVICE_OWNER != owner
-    ):
+    if _ADHOC_REFERENCE_SERVICE is None or _ADHOC_REFERENCE_SERVICE_OWNER != owner:
         _ADHOC_REFERENCE_SERVICE = ReferenceEncodeService(
             _Qwen3TTSAdhocReferenceHook(model=model, wrapper=wrapper),
             max_items=256,

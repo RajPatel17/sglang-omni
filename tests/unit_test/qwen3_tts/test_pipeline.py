@@ -1455,7 +1455,7 @@ def test_qwen3_tts_preprocessing_abort_race_cleans_late_prepared_state(
     payload = make_payload(inputs="target")
     payload.request_id = request_id
     loop = asyncio.new_event_loop()
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def run_compute() -> None:
         try:
@@ -1467,7 +1467,7 @@ def test_qwen3_tts_preprocessing_abort_race_cleans_late_prepared_state(
                 ),
                 loop,
             )
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=run_compute)
