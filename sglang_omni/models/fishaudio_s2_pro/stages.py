@@ -14,6 +14,10 @@ from typing import Any
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
+from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
+from sglang_omni.preprocessing.cache_key import (
+    reference_path_cache_key as _reference_path_cache_key,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
 from sglang_omni.scheduling.pipeline_state import store_state as _store_pipeline_state
@@ -21,10 +25,6 @@ from sglang_omni.scheduling.reference_encoder import (
     ReferenceEncodeHook,
     ReferenceEncodeKey,
     ReferenceEncodeService,
-)
-from sglang_omni.preprocessing.cache_key import (
-    hash_bytes as _hash_bytes,
-    reference_path_cache_key as _reference_path_cache_key,
 )
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
@@ -164,7 +164,9 @@ class _FishReferenceEncodeHook(
             if item.source_kind == "bytes":
                 audio, sr = audio_io.load_bytes(item.source)
             else:
-                audio, sr = audio_io.load_base64(item.media_type or "audio/wav", item.source)
+                audio, sr = audio_io.load_base64(
+                    item.media_type or "audio/wav", item.source
+                )
             audio_tensor = torch.from_numpy(audio).float().reshape(1, -1)
             return self._encode_reference_waveform(audio_tensor, int(sr))
         raise TypeError(f"unknown FishAudio reference source: {item.source_kind}")
@@ -175,9 +177,7 @@ class _FishReferenceEncodeHook(
     def load_artifact(self, stored: torch.Tensor) -> torch.Tensor:
         return stored.detach().clone().to(dtype=torch.long)
 
-    def revalidate(
-        self, item: _FishReferenceInput, key: ReferenceEncodeKey
-    ) -> bool:
+    def revalidate(self, item: _FishReferenceInput, key: ReferenceEncodeKey) -> bool:
         if item.source_kind != "path":
             return True
         return self._input_key(item) == key.input_key
@@ -193,9 +193,7 @@ class _FishReferenceEncodeHook(
             return f"base64:{media_type}:{_hash_bytes(payload)}"
         return None
 
-    def _encode_reference_waveform(
-        self, audio: torch.Tensor, sr: int
-    ) -> torch.Tensor:
+    def _encode_reference_waveform(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         import torchaudio
 
         if audio.shape[0] > 1:

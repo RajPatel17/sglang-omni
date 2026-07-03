@@ -67,12 +67,12 @@ def test_same_key_concurrent_single_flight() -> None:
     hook = _GatedHook()
     service = ReferenceEncodeService(hook, max_items=16, max_bytes=1024)
     results: list[torch.Tensor | None] = [None] * 8
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def worker(index: int) -> None:
         try:
             results[index] = service.get_or_encode("same")
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(results))]
@@ -143,12 +143,12 @@ def test_exception_propagates_to_all_waiters_and_does_not_poison() -> None:
 
     hook = _FlakyHook()
     service = ReferenceEncodeService(hook, max_items=16, max_bytes=1024)
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def worker() -> None:
         try:
             service.get_or_encode("flaky", desc="flaky")
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(4)]

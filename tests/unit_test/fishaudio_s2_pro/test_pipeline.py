@@ -577,12 +577,12 @@ def test_fish_reference_encode_service_same_key_concurrent_merge(
         max_bytes=1024,
     )
     results: list[torch.Tensor | None] = [None] * 4
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def worker(index: int) -> None:
         try:
             results[index] = service.get_or_encode({"bytes": b"ref"})
-        except BaseException as exc:
+        except Exception as exc:
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(results))]
@@ -597,9 +597,7 @@ def test_fish_reference_encode_service_same_key_concurrent_merge(
     assert not errors
     assert codec.calls == 1
     assert all(result is not None for result in results)
-    assert all(
-        torch.equal(result, torch.tensor([[1, 2, 3]])) for result in results
-    )
+    assert all(torch.equal(result, torch.tensor([[1, 2, 3]])) for result in results)
     assert service.stats()["merged"] == 3
 
 
