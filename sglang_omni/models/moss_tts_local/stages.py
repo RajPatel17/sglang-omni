@@ -465,8 +465,8 @@ class _MossLocalReferenceEncoder:
         encoder: _BatchedReferenceEncoder,
         *,
         n_vq: int,
-        max_items: int,
-        max_bytes: int,
+        max_items: int | None = 256,
+        max_bytes: int | None = 64 * 1024 * 1024,
     ) -> None:
         self._service = ReferenceEncodeService(
             _MossLocalReferenceEncodeHook(encoder, n_vq=n_vq),
