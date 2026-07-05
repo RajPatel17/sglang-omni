@@ -526,9 +526,7 @@ class ModelRunner:
         host_buf[:n].copy_(ids[:n], non_blocking=True)
         return host_buf
 
-    def _next_token_ids_host_staging(
-        self, n: int, dtype: torch.dtype
-    ) -> torch.Tensor:
+    def _next_token_ids_host_staging(self, n: int, dtype: torch.dtype) -> torch.Tensor:
         """Pinned ping-pong host buffer for the plain-LM next-token-ids
         snapshot. Grows to the largest batch seen; two buffers so resolve(N)
         reads one while launch(N+1)'s async copy writes the other."""

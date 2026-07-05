@@ -1741,9 +1741,7 @@ class OmniScheduler:
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if out_cache_loc is None or out_cache_loc.numel() < len(drop_indices):
             return
-        idx = torch.tensor(
-            drop_indices, dtype=torch.long, device=out_cache_loc.device
-        )
+        idx = torch.tensor(drop_indices, dtype=torch.long, device=out_cache_loc.device)
         self.token_to_kv_pool_allocator.free(out_cache_loc[idx])
 
     def _drop_stale_overrun(self, batch):
@@ -1763,9 +1761,7 @@ class OmniScheduler:
         keep = [i for i, d in enumerate(drop) if not d]
         # filter_batch nulls out_cache_loc; free the dropped rows' step slots
         # first (their requests' own KV was already freed by the drain).
-        self._free_overrun_step_slots(
-            batch, [i for i, d in enumerate(drop) if d]
-        )
+        self._free_overrun_step_slots(batch, [i for i, d in enumerate(drop) if d])
         batch.filter_batch(keep_indices=keep)
         return batch if batch.reqs else None
 
