@@ -654,6 +654,62 @@ def test_fish_reference_encode_service_failure_does_not_poison(
     assert codec.calls == 2
 
 
+def test_fish_reference_path_mutation_returns_but_does_not_cache(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sglang_omni.models.fishaudio_s2_pro.stages import _FishReferenceEncodeHook
+
+    ref_path = tmp_path / "ref.wav"
+    ref_path.write_bytes(b"version-a")
+
+    def load(path: str):
+        assert path == str(ref_path)
+        return torch.zeros((1, 8), dtype=torch.float32), 16000
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torchaudio",
+        SimpleNamespace(
+            load=load,
+            functional=SimpleNamespace(
+                resample=lambda audio, sr, target_sr: audio,
+            ),
+        ),
+    )
+
+    class _Codec:
+        sample_rate = 16000
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode(self, audios: torch.Tensor, audio_lengths: torch.Tensor):
+            del audios, audio_lengths
+            self.calls += 1
+            if self.calls == 1:
+                ref_path.write_bytes(b"version-b")
+            return torch.tensor([[self.calls, self.calls + 1]], dtype=torch.long), None
+
+    codec = _Codec()
+    service = ReferenceEncodeService(
+        _FishReferenceEncodeHook(codec=codec, checkpoint_id="ckpt"),
+        max_items=16,
+        max_bytes=1024,
+    )
+
+    first = service.get_or_encode({"audio_path": str(ref_path)})
+    assert torch.equal(first, torch.tensor([[1, 2]], dtype=torch.long))
+    assert service.stats()["entries"] == 0
+
+    second = service.get_or_encode({"audio_path": str(ref_path)})
+    assert torch.equal(second, torch.tensor([[2, 3]], dtype=torch.long))
+    assert service.stats()["entries"] == 1
+
+    third = service.get_or_encode({"audio_path": str(ref_path)})
+    assert torch.equal(third, torch.tensor([[2, 3]], dtype=torch.long))
+    assert codec.calls == 2
+
+
 def test_decoder_forward_kvcached_obeys_compiled_batch_size_cap() -> None:
     from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.modeling import (
         FishQwen3AudioDecoder,

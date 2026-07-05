@@ -122,11 +122,6 @@ class ReferenceEncodeService(Generic[InputT, ArtifactT, StoredT]):
                 stored = follower_fut.result(timeout=self._timeout_s)
             except concurrent.futures.TimeoutError:
                 raise
-            except BaseException as cause:
-                label = desc or key.input_key
-                raise RuntimeError(
-                    f"reference encode failed for {label}: {cause}"
-                ) from cause
             return self._hook.load_artifact(stored)
 
         assert leader_fut is not None

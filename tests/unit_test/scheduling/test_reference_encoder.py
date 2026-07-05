@@ -161,6 +161,8 @@ def test_exception_propagates_to_all_waiters_and_does_not_poison() -> None:
         thread.join(timeout=5)
 
     assert len(errors) == 4
+    assert all(isinstance(error, ValueError) for error in errors)
+    assert all(str(error) == "boom" for error in errors)
     assert service.stats()["entries"] == 0
     result = service.get_or_encode("flaky")
     assert torch.equal(result, torch.tensor([9], dtype=torch.long))
@@ -314,4 +316,6 @@ def test_revalidate_exception_propagates_to_followers_without_timeout() -> None:
 
     assert all(not thread.is_alive() for thread in threads)
     assert len(errors) == 4
+    assert all(isinstance(error, RuntimeError) for error in errors)
+    assert all(str(error) == "revalidate boom" for error in errors)
     assert len(service._inflight) == 0
