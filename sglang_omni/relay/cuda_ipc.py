@@ -24,6 +24,49 @@ logger = logging.getLogger(__name__)
 _PEER_ENABLED: set[tuple[int, int]] = set()
 _PEER_VISIBILITY_WARNED: set[tuple[int, int, int]] = set()
 
+# Completion-wait tuning. The spin window is sized to catch the small,
+# latency-sensitive completions that dominate decode (e.g. per-frame hidden
+# states, a few microseconds over NVLink) with no added latency; larger copies
+# correctly fall through to backoff, where the added detection latency is
+# negligible next to a multi-millisecond copy and the CPU is freed meanwhile.
+# These are provisional defaults, NOT measured: they should be tuned against the
+# Phase-0 profiling (issue #907) on target hardware before being trusted.
+_WAIT_SPIN_SECONDS = 20e-6
+_WAIT_BACKOFF_MIN_SECONDS = 50e-6
+_WAIT_BACKOFF_MAX_SECONDS = 1e-3
+
+
+async def _await_ready(
+    predicate: Callable[[], bool],
+    *,
+    deadline: float,
+    loop: asyncio.AbstractEventLoop,
+    timeout_message: str,
+) -> int:
+    """Wait until ``predicate`` is true without busy-spinning.
+
+    Phase 1 spins tightly for a short bounded window so the common fast
+    completion returns with no added latency. Phase 2 falls back to exponential
+    backoff with real sleeps, so a slow or hung transfer does not keep the
+    event-loop thread (and, via cudaEventQuery, the CUDA driver) fully busy.
+    Returns the number of polls performed.
+    """
+    polls = 0
+    spin_deadline = loop.time() + _WAIT_SPIN_SECONDS
+    while loop.time() < spin_deadline:
+        if predicate():
+            return polls
+        polls += 1
+        await asyncio.sleep(0)
+    delay = _WAIT_BACKOFF_MIN_SECONDS
+    while not predicate():
+        if loop.time() > deadline:
+            raise TimeoutError(timeout_message)
+        polls += 1
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _WAIT_BACKOFF_MAX_SECONDS)
+    return polls
+
 
 def _parse_device_id(device: str) -> int:
     if device.startswith("cuda:"):
@@ -148,6 +191,7 @@ class CudaIpcPutOperation(RelayOperation):
         request_id: str | None,
         size: int,
         release_cb: Callable[[], None],
+        fail_cb: Callable[[BaseException], None],
     ) -> None:
         self._metadata = metadata
         self._ready_event: torch.cuda.Event | None = ready_event
@@ -157,6 +201,7 @@ class CudaIpcPutOperation(RelayOperation):
         self._request_id = request_id
         self._size = size
         self._release_cb = release_cb
+        self._fail_cb = fail_cb
         self._completed = False
 
     @property
@@ -169,12 +214,36 @@ class CudaIpcPutOperation(RelayOperation):
         wait_start = _comm_now_ns()
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        polls = 0
-        while not self._ack_map.is_done(self._ack_index):
-            if loop.time() > deadline:
-                raise TimeoutError("cuda_ipc receiver did not ack slot in time")
-            polls += 1
-            await asyncio.sleep(0)
+        # The spin+backoff helper below is an interim fix for the busy-spin only;
+        # the sender still polls a shared-mmap ack byte. The end-state is a truly
+        # event-driven wait, via one of two routes:
+        #   - eventfd + loop.add_reader (preferred): the receiver writes the
+        #     eventfd and the event loop wakes this coroutine directly -- zero CPU,
+        #     no helper thread, and a closed fd surfaces peer death immediately.
+        #     Cost: an eventfd is a raw fd, so it must be handed across the process
+        #     boundary (fork-inherit, or SCM_RIGHTS over a unix socket).
+        #   - named pipe (FIFO): path-based like today's ack file (no fd-passing),
+        #     and a pipe read is likewise add_reader-drivable. Slightly heavier
+        #     than eventfd and needs FIFO lifecycle management.
+        # TODO(comm): replace the shared-mmap ack poll with an eventfd + add_reader
+        # (falling back to a named pipe only if fd-passing is impractical) so the
+        # sender blocks event-driven with zero CPU and prompt peer-death detection,
+        # instead of this spin+backoff and the blunt 30s timeout.
+        try:
+            polls = await _await_ready(
+                lambda: self._ack_map.is_done(self._ack_index),
+                deadline=deadline,
+                loop=loop,
+                timeout_message="cuda_ipc receiver did not ack slot in time",
+            )
+        except TimeoutError as exc:
+            # Timeout is a hard relay failure; do not return a possibly live slot
+            # to normal traffic.
+            self._completed = True
+            self._fail_cb(exc)
+            self._source_tensor = None
+            self._ready_event = None
+            raise
         self._completed = True
         self._release_cb()
         self._source_tensor = None
@@ -219,12 +288,12 @@ class CudaIpcGetOperation(RelayOperation):
         wait_start = _comm_now_ns()
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        polls = 0
-        while not self._event.query():
-            if loop.time() > deadline:
-                raise TimeoutError("cuda_ipc copy did not complete in time")
-            polls += 1
-            await asyncio.sleep(0)
+        polls = await _await_ready(
+            self._event.query,
+            deadline=deadline,
+            loop=loop,
+            timeout_message="cuda_ipc copy did not complete in time",
+        )
         self._completed = True
         self._ack_map.mark_done(self._ack_index)
         self._pool_tensor = None
@@ -275,6 +344,8 @@ class CudaIpcRelay(Relay):
 
         self._remote_pools: dict[str, torch.Tensor] = {}
         self._remote_acks: dict[str, _AckMap] = {}
+        self._failed_error: BaseException | None = None
+        self._failed_event = asyncio.Event()
 
     def __del__(self) -> None:
         try:
@@ -340,6 +411,42 @@ class CudaIpcRelay(Relay):
             raise RuntimeError("cuda_ipc local ack map was not initialized")
         return pool_tensor, pool_id, pool_storage_handle, allocator, ack_map
 
+    def _mark_failed(self, exc: BaseException) -> None:
+        if self._failed_error is None:
+            self._failed_error = exc
+            self._failed_event.set()
+
+    def _raise_if_failed(self) -> None:
+        if self._failed_error is not None:
+            raise RuntimeError("cuda_ipc relay failed") from self._failed_error
+
+    async def _acquire_slot(self, allocator: CreditAllocator) -> int:
+        self._raise_if_failed()
+        acquire_task = asyncio.create_task(allocator.acquire_async())
+        fail_task = asyncio.create_task(self._failed_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {acquire_task, fail_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if fail_task in done:
+                if acquire_task in done:
+                    allocator.release(acquire_task.result())
+                self._raise_if_failed()
+                raise RuntimeError("cuda_ipc relay failed")
+
+            offset = acquire_task.result()
+            try:
+                self._raise_if_failed()
+            except Exception:
+                allocator.release(offset)
+                raise
+            return offset
+        finally:
+            for task in (acquire_task, fail_task):
+                if not task.done():
+                    task.cancel()
+
     def _get_remote_pool(
         self,
         metadata: dict[str, Any],
@@ -375,6 +482,7 @@ class CudaIpcRelay(Relay):
         request_id: str | None = None,
         dst_rank: int | None = None,
     ) -> CudaIpcPutOperation:
+        self._raise_if_failed()
         if not tensor.is_cuda:
             raise ValueError(
                 "cuda_ipc relay can only transfer CUDA tensors; "
@@ -396,7 +504,7 @@ class CudaIpcRelay(Relay):
             )
 
         acquire_start = _comm_now_ns()
-        offset = await allocator.acquire_async()
+        offset = await self._acquire_slot(allocator)
         acquire_ms = _comm_elapsed_ms(acquire_start)
         slot_index = int(offset // self.slot_size)
         ack_map.clear(slot_index)
@@ -456,6 +564,7 @@ class CudaIpcRelay(Relay):
             request_id=request_id,
             size=size,
             release_cb=lambda: allocator.release(offset),
+            fail_cb=self._mark_failed,
         )
 
     async def get_async(

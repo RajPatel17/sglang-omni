@@ -7,8 +7,8 @@ from typing import Any
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.router import CommRouter
 from sglang_omni.comm.data_ref import DataRef, TransportKind
+from sglang_omni.comm.router import CommRouter
 from sglang_omni.proto import StagePayload
 from sglang_omni.relay.base import Relay
 

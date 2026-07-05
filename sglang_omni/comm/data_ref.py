@@ -70,7 +70,9 @@ class BackendRef:
         cls, *, transport: TransportKind, relay_info: dict[str, Any]
     ) -> "BackendRef":
         transfer_info = _dict(relay_info, "transfer_info")
-        return cls(transport=transport, info=relay_info, length=_int(transfer_info, "size"))
+        return cls(
+            transport=transport, info=relay_info, length=_int(transfer_info, "size")
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -160,7 +162,9 @@ class DataRef:
             layout=DataLayout(_str(value, "layout")),
             buffer=BackendRef.from_dict(_dict(value, "buffer")),
             header=_optional_str(value, "header"),
-            tensors=tuple(TensorMeta.from_dict(item) for item in _list(value, "tensors")),
+            tensors=tuple(
+                TensorMeta.from_dict(item) for item in _list(value, "tensors")
+            ),
             shape=_ints(value, "shape") if "shape" in value else None,
             dtype=_optional_str(value, "dtype"),
             offset=_int(value, "offset") if "offset" in value else None,

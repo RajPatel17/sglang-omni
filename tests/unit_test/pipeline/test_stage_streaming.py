@@ -10,7 +10,7 @@ import torch
 from pydantic import ValidationError
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef, TransportKind
+from sglang_omni.comm.data_ref import DataKind, DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
@@ -105,20 +105,34 @@ async def _make_relay_chunk(
     data,
     metadata: dict | None = None,
 ) -> DataReadyMessage:
-    control_plane = _FakeControlPlane()
-    await stage_io.send_stream_chunk(
+    object_id = f"{request_id}:stream:{from_stage}:{to_stage}:{chunk_id}"
+    data_ref, op = await stage_io.write_tensor(
         relay,
-        control_plane,
-        request_id=request_id,
-        data=data,
-        target_stage=to_stage,
-        target_endpoint=f"inproc://{to_stage}",
-        from_stage=from_stage,
-        chunk_id=chunk_id,
-        metadata=metadata,
+        object_id,
+        data,
         transport=TransportKind.SHM,
+        kind=DataKind.STREAM_CHUNK,
+        request_id=request_id,
+        from_stage=from_stage,
+        to_stage=to_stage,
     )
-    return control_plane.stage_messages[0][2]
+    pending_ops = [op]
+    data_ref = await stage_io._with_stream_metadata(
+        relay,
+        data_ref,
+        metadata,
+        TransportKind.SHM,
+        pending_ops,
+    )
+    for pending_op in pending_ops:
+        asyncio.create_task(pending_op.wait_for_completion())
+    return DataReadyMessage(
+        request_id=request_id,
+        from_stage=from_stage,
+        to_stage=to_stage,
+        data_ref=data_ref.to_dict(),
+        chunk_id=chunk_id,
+    )
 
 
 async def _make_relay_payload(
@@ -134,7 +148,7 @@ async def _make_relay_payload(
         payload,
         transport=TransportKind.SHM,
     )
-    await op.wait_for_completion()
+    asyncio.create_task(op.wait_for_completion())
     return DataReadyMessage(
         request_id=payload.request_id,
         from_stage=from_stage,

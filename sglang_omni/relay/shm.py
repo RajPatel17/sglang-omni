@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from multiprocessing import shared_memory as _shm
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -20,6 +21,13 @@ import torch
 from .base import Relay, RelayOperation, register_relay
 
 logger = logging.getLogger(__name__)
+
+# Consume-wait tuning. shm is a cold, CPU-only path after the cuda_ipc split, so a
+# larger backoff cap than the GPU path is fine. Provisional defaults; tune with the
+# Phase-0 profiling (#907) if a CPU edge ever turns hot.
+_CONSUME_SPIN_SECONDS = 20e-6
+_CONSUME_BACKOFF_MIN_SECONDS = 50e-6
+_CONSUME_BACKOFF_MAX_SECONDS = 5e-3
 
 
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
@@ -58,20 +66,67 @@ class ShmOperation(RelayOperation):
 class ShmPutOperation(ShmOperation):
     """
     Handle for Put.
-    In this simplified SHM model, writing is synchronous during creation,
-    so the operation is effectively complete immediately.
+
+    The sender holds its flow-control credit until the receiver has consumed the
+    block, which the receiver signals by unlinking it (the entry disappears from
+    /dev/shm). This gives real bounded-outstanding backpressure -- at most
+    ``credits`` un-consumed blocks exist at once -- by reusing the unlink the
+    receiver already performs, with no separate ack channel.
     """
 
-    def __init__(self, metadata: Any, shm_obj: _shm.SharedMemory):
+    def __init__(
+        self,
+        metadata: Any,
+        shm_obj: _shm.SharedMemory,
+        *,
+        shm_name: str,
+        release_cb: Callable[[], None],
+    ):
         super().__init__(metadata)
         self._shm_obj = shm_obj
+        self._shm_name = shm_name
+        self._release_cb = release_cb
 
     async def wait_for_completion(self, timeout: float = 30.0) -> None:
-        # Sender simply closes the local handle; Receiver is responsible for unlinking.
-        if not self._completed:
-            self._shm_obj.close()
+        if self._completed:
+            return
+        # Sender closes its own handle; the receiver owns the unlink.
+        self._shm_obj.close()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        shm_path = f"/dev/shm/{self._shm_name}"
+        spin_deadline = loop.time() + _CONSUME_SPIN_SECONDS
+        delay = _CONSUME_BACKOFF_MIN_SECONDS
+        # Hold the credit until the receiver consumes the block (it disappears),
+        # spinning briefly then backing off so an absent consumer does not
+        # busy-spin. TODO(comm): polling /dev/shm is Linux-specific and a mild
+        # hack; a consumer->producer ack (or folding shm into the DataRef
+        # lifecycle) is cleaner. shm is a cold CPU-only path after the cuda_ipc
+        # split, so this easy-win is intentionally not a full pool + ack channel.
+        try:
+            while os.path.exists(shm_path):
+                if loop.time() > deadline:
+                    raise TimeoutError(
+                        f"shm block {self._shm_name} was not consumed in time"
+                    )
+                if loop.time() < spin_deadline:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _CONSUME_BACKOFF_MAX_SECONDS)
+        except TimeoutError:
+            # Reclaim the named block before releasing credit so repeated absent
+            # consumers cannot fill /dev/shm.
+            try:
+                self._shm_obj.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            # Always release the credit, even on timeout, so an absent or crashed
+            # consumer cannot permanently leak a slot.
             self._completed = True
-        return
+            self._release_cb()
 
 
 class ShmGetOperation(ShmOperation):
@@ -111,7 +166,10 @@ class ShmGetOperation(ShmOperation):
             finally:
                 # 3. Cleanup (Receiver owns lifecycle)
                 existing_shm.close()
-                existing_shm.unlink()
+                try:
+                    existing_shm.unlink()
+                except FileNotFoundError:
+                    pass
 
         finally:
             self._completed = True
@@ -138,15 +196,14 @@ class ShmRelay(Relay):
         if request_id is None:
             request_id = str(uuid.uuid4())
 
-        # Flow control
+        # Acquire a credit and HOLD it until the receiver consumes the block (real
+        # bounded-outstanding backpressure); it is released in
+        # ShmPutOperation.wait_for_completion once the block is unlinked.
         await self._sem.acquire()
 
         try:
-            # 1. Create SHM and write data
             shm = shm_create_from_tensor(tensor)
             size_bytes = shm.size
-
-            # 2. Construct Metadata
             metadata = {
                 "engine_id": self.engine_id,
                 "transfer_info": {
@@ -155,15 +212,16 @@ class ShmRelay(Relay):
                     "req_id": request_id,
                 },
             }
+            return ShmPutOperation(
+                metadata,
+                shm,
+                shm_name=shm.name,
+                release_cb=self._sem.release,
+            )
 
-            # 3. Release semaphore immediately (Fire-and-Forget model)
+        except Exception:
             self._sem.release()
-
-            return ShmPutOperation(metadata, shm)
-
-        except Exception as e:
-            self._sem.release()
-            raise e
+            raise
 
     async def get_async(
         self, metadata: Any, dest_tensor: torch.Tensor, request_id: str = None

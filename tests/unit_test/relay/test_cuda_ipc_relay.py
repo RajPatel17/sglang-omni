@@ -14,18 +14,93 @@ import multiprocessing as mp
 import pytest
 import torch
 
-from sglang_omni.relay.cuda_ipc import CudaIpcRelay
+from sglang_omni.relay.cuda_ipc import CudaIpcPutOperation, CudaIpcRelay
 
 _N = 1024 * 1024  # 1 MiB payload
+
+
+class _NeverAck:
+    def is_done(self, index: int) -> bool:
+        return False
 
 
 def _expected(n: int) -> torch.Tensor:
     return (torch.arange(n, dtype=torch.int64) % 251).to(torch.uint8)
 
 
+def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot() -> None:
+    released = False
+    failed: list[BaseException] = []
+
+    def release() -> None:
+        nonlocal released
+        released = True
+
+    async def run() -> None:
+        op = CudaIpcPutOperation(
+            metadata={},
+            ready_event=object(),  # type: ignore[arg-type]
+            source_tensor=object(),  # type: ignore[arg-type]
+            ack_map=_NeverAck(),  # type: ignore[arg-type]
+            ack_index=0,
+            request_id="r",
+            size=1,
+            release_cb=release,
+            fail_cb=failed.append,
+        )
+        with pytest.raises(TimeoutError, match="receiver did not ack"):
+            await op.wait_for_completion(timeout=0.0)
+
+    asyncio.run(run())
+
+    assert released is False
+    assert len(failed) == 1
+    assert isinstance(failed[0], TimeoutError)
+
+
+def test_cuda_ipc_relay_failure_wakes_blocked_slot_acquire() -> None:
+    class BlockingAllocator:
+        def __init__(self) -> None:
+            self.released: list[int] = []
+
+        async def acquire_async(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        def release(self, credit_id: int) -> None:
+            self.released.append(credit_id)
+
+    async def run() -> BlockingAllocator:
+        relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+        allocator = BlockingAllocator()
+        task = asyncio.create_task(relay._acquire_slot(allocator))
+        await asyncio.sleep(0)
+        relay._mark_failed(TimeoutError("ack timeout"))
+        with pytest.raises(RuntimeError, match="cuda_ipc relay failed"):
+            await task
+        return allocator
+
+    allocator = asyncio.run(run())
+    assert allocator.released == []
+
+
+def test_cuda_ipc_put_fails_fast_after_relay_failure() -> None:
+    async def run() -> None:
+        relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+        relay._mark_failed(TimeoutError("ack timeout"))
+        with pytest.raises(RuntimeError, match="cuda_ipc relay failed"):
+            await relay.put_async(torch.zeros(1, dtype=torch.uint8))
+
+    asyncio.run(run())
+
+
 def _sender(src_gpu: int, meta_q: mp.Queue, done_q: mp.Queue) -> None:
     torch.cuda.set_device(src_gpu)
-    relay = CudaIpcRelay(engine_id="sender", device=f"cuda:{src_gpu}")
+    relay = CudaIpcRelay(
+        engine_id="sender",
+        device=f"cuda:{src_gpu}",
+        slot_size_mb=2,
+    )
     buf = _expected(_N).to(f"cuda:{src_gpu}")
 
     async def run() -> None:

@@ -19,8 +19,7 @@ def test_comm_router_uses_cuda_ipc_for_same_node_gpu_payload_edges() -> None:
 
     assert router.outbound("local") is TransportKind.LOCAL_OBJECT
     assert router.outbound("decode") is TransportKind.CUDA_IPC
-    with pytest.raises(ValueError, match="selected cuda_ipc"):
-        router.outbound_stream("decode", torch.empty(1))
+    assert router.outbound_stream("decode", torch.empty(1)) is TransportKind.SHM
 
 
 def test_comm_router_uses_mooncake_only_for_remote_edges() -> None:

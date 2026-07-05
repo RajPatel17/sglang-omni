@@ -51,6 +51,11 @@ class CommRouter:
         return self._physical_outbound(target)
 
     def _physical_outbound(self, target: str) -> TransportKind:
+        # Invariant: anything not in remote_stage_names is assumed same-node, so a
+        # future placement pass MUST populate remote_stage_names for every
+        # cross-node edge -- otherwise a cross-node target silently falls through
+        # to cuda_ipc/shm here. A hard assertion needs the Phase-1 node config,
+        # which does not exist yet.
         if target in self.remote_stage_names:
             return TransportKind.MOONCAKE
         if self.self_is_gpu and target in self.gpu_stage_names:
@@ -65,10 +70,10 @@ class CommRouter:
             )
         kind = self.outbound(target)
         if kind is TransportKind.CUDA_IPC and not data.is_cuda:
-            raise ValueError(
-                f"GPU stage edge {self.stage_name!r}->{target!r} selected "
-                "cuda_ipc, but the stream chunk is not CUDA-resident"
-            )
+            # Transport must follow the actual tensor device, not just placement:
+            # a GPU-placed edge can legitimately carry a host-resident chunk. Fall
+            # back to SHM (the host transport) instead of failing the transfer.
+            return TransportKind.SHM
         return kind
 
     def inbound(self, from_stage: str) -> TransportKind:
