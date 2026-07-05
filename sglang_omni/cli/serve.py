@@ -24,7 +24,12 @@ _ASYNC_DECODE_FACTORIES = frozenset(
     {
         "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
         "sglang_omni.models.moss_tts_local.stages.create_sglang_tts_engine_executor",
+        "sglang_omni.models.moss_transcribe_diarize.stages."
+        "create_sglang_moss_transcribe_diarize_executor",
     }
+)
+_ASYNC_DECODE_SUPPORTED_MODELS = (
+    "Higgs TTS, MOSS-TTS-Local, and MOSS-Transcribe-Diarize"
 )
 _QWEN_PARTIAL_START_TALKER_FACTORY = (
     "sglang_omni.models.qwen3_omni.stages.create_talker_ar_executor_from_config"
@@ -795,8 +800,6 @@ def _apply_stage_factory_args_override(
     stage_name: str,
     updates: dict[str, object],
     reason: str,
-    supported_factories: frozenset[str] | None = None,
-    flag_name: str | None = None,
 ) -> None:
     matching_stages = _find_matching_stages(
         pipeline_config,
@@ -804,13 +807,6 @@ def _apply_stage_factory_args_override(
         reason=reason,
     )
     for stage in matching_stages:
-        if supported_factories is not None and stage.factory not in supported_factories:
-            display_flag = flag_name or reason
-            raise typer.BadParameter(
-                f"{display_flag} currently supports only Higgs TTS and "
-                f"MOSS-TTS-Local; stage {stage.name!r} uses factory "
-                f"{stage.factory!r}"
-            )
         factory_args = dict(stage.factory_args or {})
         factory_args.update(updates)
         stage.factory_args = factory_args
@@ -842,14 +838,28 @@ def apply_decode_mode_cli_overrides(
         updates["async_decode_min_batch_size"] = int(async_lookahead_min_batch_size)
     if not updates:
         return pipeline_config
-    _apply_stage_factory_args_override(
-        pipeline_config,
-        stage_name="tts_engine",
-        updates=updates,
-        reason="decode mode override",
-        supported_factories=_ASYNC_DECODE_FACTORIES,
-        flag_name="--decode-mode/--async-lookahead-min-batch-size",
-    )
+    # Match by factory, not by stage name: the async-decode stage is named
+    # "tts_engine" for Higgs / MOSS-TTS-Local but "asr" for
+    # MOSS-Transcribe-Diarize.
+    matching_stages = [
+        stage
+        for stage in pipeline_config.stages
+        if stage.factory in _ASYNC_DECODE_FACTORIES
+    ]
+    if not matching_stages:
+        raise typer.BadParameter(
+            "--decode-mode/--async-lookahead-min-batch-size currently supports "
+            f"only {_ASYNC_DECODE_SUPPORTED_MODELS}; no stage in this pipeline "
+            "uses a supported factory"
+        )
+    for stage in matching_stages:
+        factory_args = dict(stage.factory_args or {})
+        factory_args.update(updates)
+        stage.factory_args = factory_args
+
+        stage_runtime_overrides = pipeline_config.runtime_overrides.get(stage.name)
+        if isinstance(stage_runtime_overrides, dict):
+            stage_runtime_overrides.update(updates)
     return pipeline_config
 
 
@@ -1144,12 +1154,12 @@ def serve(
             "--decode-mode",
             "--decode_mode",
             help=(
-                "Decode execution mode for the tts_engine stage: "
+                "Decode execution mode for the supported generation stage: "
                 "async|sync. Omit this flag to use the pipeline config default "
                 "(async for Higgs TTS). Async mode enables one-step lookahead, "
                 "which can overlap the previous step's host-side collect with "
-                "the next GPU forward. Available for Higgs TTS and "
-                "MOSS-TTS-Local."
+                "the next GPU forward. Available for Higgs TTS, MOSS-TTS-Local, "
+                "and MOSS-Transcribe-Diarize."
             ),
         ),
     ] = None,

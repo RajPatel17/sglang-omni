@@ -96,29 +96,36 @@ class ModelRunner:
         self._async_query_hit: int = 0
         self._async_query_miss: int = 0
 
-    def _next_host_staging(self, device_staging: torch.Tensor) -> torch.Tensor:
-        """Return a pinned host staging buffer mirroring ``device_staging``'s
-        full shape, ping-ponging between two buffers on each call. Only runners
-        that stage the collect to host (Higgs) call this; device-snapshot
-        runners (MOSS-TTS-Local) never do.
+    def _next_host_staging(
+        self, shape: tuple[int, ...] | torch.Size, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Return a pinned host staging buffer covering ``shape``/``dtype``,
+        ping-ponging between two buffers on each call. Runners that stage the
+        collect to host use this: Higgs passes its fixed CG staging shape, the
+        base plain-LM launch passes the step's ``(batch_size,)`` ids shape.
+        Device-snapshot runners (MOSS-TTS-Local) never do.
 
         Two buffers are required: resolve(N) reads one on the host while
         launch(N+1)'s async host copy writes the other. That CPU-read vs
         GPU-write overlap is not protected by single-stream ordering.
-        Buffers are allocated lazily on first use (the base runner does not
-        know the model-specific staging shape at construction time).
+        Buffers are allocated lazily on first use and replaced when the
+        requested dim 0 outgrows them (or trailing dims / dtype change); a
+        resolve still holding the previous buffer keeps it alive, so
+        replacement cannot alias an in-flight snapshot.
         """
-        if not self._host_staging_buffers:
-            self._host_staging_buffers = [
-                torch.empty(
-                    device_staging.shape,
-                    dtype=device_staging.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
+        bufs = self._host_staging_buffers
+        if (
+            not bufs
+            or bufs[0].dtype != dtype
+            or bufs[0].shape[1:] != tuple(shape[1:])
+            or bufs[0].shape[0] < shape[0]
+        ):
+            self._host_staging_buffers = bufs = [
+                torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
                 for _ in range(2)
             ]
-        buf = self._host_staging_buffers[self._staging_slot]
+            self._staging_slot = 0
+        buf = bufs[self._staging_slot]
         self._staging_slot ^= 1
         return buf
 
@@ -479,12 +486,14 @@ class ModelRunner:
     def lookahead_eligible(self, batch: Any) -> bool:
         """Whether this batch may use one-step async-decode lookahead.
 
-        Default True. A runner whose collect has a sync-only fallback (one that
-        would diverge from sync under a one-step lag) overrides this to route
-        those batches synchronously. The scheduler's async gate consults it.
+        The default ``post_decode_launch`` samples at launch time, one step
+        before resolve appends the previous token to host ``req.output_ids``,
+        so ``_apply_repetition_penalty`` would read a one-token-stale history
+        and systematically diverge from the sync path — route those batches
+        synchronously. A runner whose collect has other sync-only fallbacks
+        overrides this. The scheduler's async gate consults it.
         """
-        del batch
-        return True
+        return all(req.sampling_params.repetition_penalty == 1.0 for req in batch.reqs)
 
     def post_process_outputs(
         self,
@@ -522,26 +531,9 @@ class ModelRunner:
             )
         n = len(requests)
         ids = result.next_token_ids
-        host_buf = self._next_token_ids_host_staging(n, ids.dtype)
+        host_buf = self._next_host_staging((n,), ids.dtype)
         host_buf[:n].copy_(ids[:n], non_blocking=True)
         return host_buf
-
-    def _next_token_ids_host_staging(self, n: int, dtype: torch.dtype) -> torch.Tensor:
-        """Pinned ping-pong host buffer for the plain-LM next-token-ids
-        snapshot. Grows to the largest batch seen; two buffers so resolve(N)
-        reads one while launch(N+1)'s async copy writes the other."""
-        bufs = getattr(self, "_token_ids_host_bufs", None)
-        if bufs is None or bufs[0].numel() < n or bufs[0].dtype != dtype:
-            cap = max(n, 64)
-            bufs = [
-                torch.empty(cap, dtype=dtype, device="cpu", pin_memory=True)
-                for _ in range(2)
-            ]
-            self._token_ids_host_bufs = bufs
-            self._token_ids_host_slot = 0
-        buf = bufs[self._token_ids_host_slot]
-        self._token_ids_host_slot ^= 1
-        return buf
 
     def post_decode_resolve(
         self,

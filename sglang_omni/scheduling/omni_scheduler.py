@@ -1697,11 +1697,10 @@ class OmniScheduler:
         keep = [i for i, was_finished in enumerate(pre_finished) if not was_finished]
         if len(keep) < len(batch.reqs):
             # Free the decode slot the overrun step allocated for each dropped
-            # row: the request's own KV was already freed when it finished, and
-            # nothing else covers this extra per-step slot — leaking it drifts
-            # allocator state and breaks bit-reproducibility vs the sync loop.
+            # row; the request's own KV free does not cover it (see
+            # _free_overrun_step_slots for the cache-config gate).
             self._free_overrun_step_slots(
-                getattr(pending_step, "forward_batch", None),
+                pending_step.forward_batch.out_cache_loc,
                 [i for i, was in enumerate(pre_finished) if was],
             )
             if result.next_token_ids is not None and keep:
@@ -1729,18 +1728,34 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
 
-    def _free_overrun_step_slots(self, forward_batch, drop_indices) -> None:
+    def _free_overrun_step_slots(self, out_cache_loc, drop_indices) -> None:
         """Free the per-step decode KV slots allocated for rows whose request
         already finished or retracted in a prior step (the lookahead overrun).
 
-        ``prepare_for_decode`` allocated one slot per row for this step;
-        ``cache_finished_req``/retract freed the request's own tokens only, so
-        the dropped rows' step slots would otherwise leak."""
-        if not drop_indices or forward_batch is None:
+        ``prepare_for_decode`` allocated one slot per row for this step and
+        counted it into ``kv_committed_len``. RadixCache's
+        ``cache_finished_req`` frees ``(origin+output)[:kv_committed_len]``,
+        which the actual token count truncates BELOW the overrun slot, so the
+        dropped rows' step slots would otherwise leak.
+
+        Only safe under RadixCache with page_size=1: ChunkCache frees
+        ``req_to_token[:kv_committed_len]`` directly — overrun slot included —
+        so a compensating free here would double-free (two requests would later
+        share one KV slot); paged allocators free whole pages, and the overrun
+        slot's page was already freed with the request's tail tokens. In those
+        configurations the request-side free covers the slot and we skip.
+        """
+        if not drop_indices:
             return
-        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-        if out_cache_loc is None or out_cache_loc.numel() < len(drop_indices):
+        if self.page_size != 1 or self.server_args.disable_radix_cache:
             return
+        if out_cache_loc is None:
+            logger.warning("overrun step-slot free skipped: out_cache_loc is None")
+            return
+        assert max(drop_indices) < out_cache_loc.numel(), (
+            f"overrun drop index {max(drop_indices)} out of range "
+            f"({out_cache_loc.numel()} step slots)"
+        )
         idx = torch.tensor(drop_indices, dtype=torch.long, device=out_cache_loc.device)
         self.token_to_kv_pool_allocator.free(out_cache_loc[idx])
 
@@ -1761,7 +1776,9 @@ class OmniScheduler:
         keep = [i for i, d in enumerate(drop) if not d]
         # filter_batch nulls out_cache_loc; free the dropped rows' step slots
         # first (their requests' own KV was already freed by the drain).
-        self._free_overrun_step_slots(batch, [i for i, d in enumerate(drop) if d])
+        self._free_overrun_step_slots(
+            batch.out_cache_loc, [i for i, d in enumerate(drop) if d]
+        )
         batch.filter_batch(keep_indices=keep)
         return batch if batch.reqs else None
 
