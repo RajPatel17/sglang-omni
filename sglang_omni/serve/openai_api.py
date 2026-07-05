@@ -1644,9 +1644,7 @@ async def _transcription_stream(
                 yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
     except Exception as exc:
         # Headers are already sent; surface the failure as an SSE error event.
-        logger.exception(
-            "Error streaming transcription for request %s", request_id
-        )
+        logger.exception("Error streaming transcription for request %s", request_id)
         payload = {"type": "error", "error": {"message": str(exc)}}
         yield f"data: {json.dumps(payload)}\n\n"
         return
