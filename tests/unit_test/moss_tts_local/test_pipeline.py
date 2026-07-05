@@ -1538,9 +1538,7 @@ def test_cached_reference_encoder_duration_gate(tmp_path, monkeypatch):
     assert len(enc._service._inflight) == 0
 
 
-def test_cached_reference_encoder_revalidate_skips_duration_gate(
-    tmp_path, monkeypatch
-):
+def test_cached_reference_encoder_revalidate_skips_duration_gate(tmp_path, monkeypatch):
     from sglang_omni.models.moss_tts_local.stages import _MossLocalReferenceEncoder
 
     ref = tmp_path / "ref.wav"
