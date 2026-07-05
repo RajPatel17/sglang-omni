@@ -91,6 +91,8 @@ from sglang_omni.serve.protocol import (
     RolloutSamplingParams,
     SpeechBatchResponse,
     TranscriptionResponse,
+    TranscriptionTextDeltaEvent,
+    TranscriptionTextDoneEvent,
     TranscriptionUsage,
     UpdateWeightFromDiskRequest,
     UpdateWeightsFromDistributedRequest,
@@ -1510,6 +1512,7 @@ def _register_transcriptions(app: FastAPI) -> None:
         prompt: str | None = Form(default=None),
         response_format: str = Form(default="json"),
         temperature: float | None = Form(default=None),
+        stream: bool = Form(default=False),
     ) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
@@ -1520,6 +1523,45 @@ def _register_transcriptions(app: FastAPI) -> None:
         audio_bytes = await file.read()
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+
+        normalized_response_format = response_format.strip().lower()
+        if stream:
+            # verbose_json needs the full text for segment parsing; only the
+            # plain-text formats can stream.
+            if normalized_response_format not in {"json", "text"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "stream=true supports only response_format 'json' or "
+                        f"'text', got {response_format!r}"
+                    ),
+                )
+            gen_req = build_transcription_generate_request(
+                audio_bytes=audio_bytes,
+                filename=file.filename,
+                content_type=file.content_type,
+                model=model or default_model,
+                language=language,
+                prompt=prompt,
+                temperature=temperature,
+                stream=True,
+            )
+            adapter = resolve_adapter(getattr(app.state, "architectures", None))
+            duration_s = _probe_audio_duration(audio_bytes)
+            return StreamingResponse(
+                _transcription_stream(
+                    client,
+                    gen_req,
+                    request_id=request_id,
+                    adapter=adapter,
+                    duration_s=duration_s,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Request-Id": request_id,
+                },
+            )
 
         gen_req = build_transcription_generate_request(
             audio_bytes=audio_bytes,
@@ -1540,7 +1582,6 @@ def _register_transcriptions(app: FastAPI) -> None:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         text = result.text
-        normalized_response_format = response_format.strip().lower()
         if normalized_response_format == "text":
             return PlainTextResponse(text)
         if normalized_response_format not in {"json", "verbose_json"}:
@@ -1575,6 +1616,50 @@ def _register_transcriptions(app: FastAPI) -> None:
         )
 
 
+async def _transcription_stream(
+    client: Client,
+    gen_req: GenerateRequest,
+    *,
+    request_id: str,
+    adapter: Any,
+    duration_s: float,
+) -> AsyncIterator[str]:
+    """SSE generator for streaming transcriptions.
+
+    Emits OpenAI-style ``transcript.text.delta`` events for each partial text
+    chunk, then a terminal ``transcript.text.done`` event carrying the full
+    post-processed transcript.
+    """
+    final_text: str | None = None
+    try:
+        async for chunk in client.generate(gen_req, request_id=request_id):
+            if chunk.finish_reason is not None:
+                # Terminal aggregate result — capture the authoritative full
+                # text for the done event, do not re-emit it as a delta.
+                if isinstance(chunk.text, str) and chunk.text:
+                    final_text = chunk.text
+                continue
+            if chunk.modality == "text" and chunk.text:
+                event = TranscriptionTextDeltaEvent(delta=chunk.text)
+                yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
+    except Exception as exc:
+        # Headers are already sent; surface the failure as an SSE error event.
+        logger.exception(
+            "Error streaming transcription for request %s", request_id
+        )
+        payload = {"type": "error", "error": {"message": str(exc)}}
+        yield f"data: {json.dumps(payload)}\n\n"
+        return
+
+    text = adapter.postprocess_text(final_text or "")
+    usage = (
+        TranscriptionUsage(seconds=math.ceil(duration_s)) if duration_s > 0 else None
+    )
+    done_event = TranscriptionTextDoneEvent(text=text, usage=usage)
+    yield f"data: {done_event.model_dump_json(exclude_none=True)}\n\n"
+    yield f"data: {STREAM_DONE_SENTINEL}\n\n"
+
+
 def _probe_audio_duration(audio_bytes: bytes) -> float:
     """Best-effort audio duration (seconds) from raw upload bytes.
 
@@ -1602,6 +1687,7 @@ def build_transcription_generate_request(
     language: str | None,
     prompt: str | None,
     temperature: float | None,
+    stream: bool = False,
 ) -> GenerateRequest:
     params: dict[str, Any] = {"task": "transcribe"}
     if language is not None:
@@ -1619,7 +1705,7 @@ def build_transcription_generate_request(
             "content_type": content_type,
         },
         extra_params=params,
-        stream=False,
+        stream=stream,
         output_modalities=["text"],
         metadata={"task": "asr"},
     )

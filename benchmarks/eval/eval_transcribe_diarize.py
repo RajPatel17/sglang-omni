@@ -105,7 +105,13 @@ DIARIZATION_METRICS_PERCENT_ORDER: Final[tuple[str, ...]] = (
 )
 
 
-def make_send_fn(api_url: str, model_path: str, language: str | None) -> SendFn:
+def make_send_fn(
+    api_url: str,
+    model_path: str,
+    language: str | None,
+    *,
+    stream: bool = False,
+) -> SendFn:
     async def send_fn(
         session: aiohttp.ClientSession,
         sample: Movies800Sample,
@@ -122,10 +128,17 @@ def make_send_fn(api_url: str, model_path: str, language: str | None) -> SendFn:
         try:
             async with session.post(
                 api_url,
-                data=_request_form(audio_bytes, audio_path, model_path, language),
+                data=_request_form(
+                    audio_bytes, audio_path, model_path, language, stream=stream
+                ),
             ) as response:
                 if response.status != 200:
                     result.error = f"HTTP {response.status}: {await response.text()}"
+                elif stream:
+                    result.text = await _consume_transcription_stream(
+                        response, result, start
+                    )
+                    result.is_success = True
                 else:
                     result.text = extract_prediction_text(await response.json())
                     result.is_success = True
@@ -145,6 +158,44 @@ def make_send_fn(api_url: str, model_path: str, language: str | None) -> SendFn:
     return send_fn
 
 
+async def _consume_transcription_stream(
+    response: aiohttp.ClientResponse,
+    result: RequestResult,
+    start: float,
+) -> str:
+    """Read the SSE transcription stream, filling streaming latency metrics.
+
+    Records ``text_ttft_s`` on the first ``transcript.text.delta`` and the
+    gaps between subsequent deltas in ``inter_chunk_s``. Returns the full
+    text from the terminal ``transcript.text.done`` event.
+    """
+    final_text: str | None = None
+    last_delta_t: float | None = None
+    async for raw_line in response.content:
+        line = raw_line.decode("utf-8").strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload == "[DONE]":
+            break
+        event = json.loads(payload)
+        event_type = event.get("type")
+        if event_type == "transcript.text.delta":
+            now = time.perf_counter()
+            if result.text_ttft_s is None:
+                result.text_ttft_s = now - start
+            elif last_delta_t is not None:
+                result.inter_chunk_s.append(now - last_delta_t)
+            last_delta_t = now
+        elif event_type == "transcript.text.done":
+            final_text = event.get("text")
+        elif event_type == "error":
+            raise ValueError(f"Stream error event: {event.get('error')}")
+    if not isinstance(final_text, str):
+        raise ValueError("Stream ended without a transcript.text.done event")
+    return final_text.strip()
+
+
 async def run_eval(
     samples: list[Movies800Sample],
     *,
@@ -156,6 +207,7 @@ async def run_eval(
     request_rate: float,
     disable_tqdm: bool,
     request_timeout_s: int,
+    stream: bool = False,
 ) -> tuple[list[RequestResult], float]:
     runner = BenchmarkRunner(
         RunConfig(
@@ -172,6 +224,7 @@ async def run_eval(
             api_url=f"{base_url}/v1/audio/transcriptions",
             model_path=model_path,
             language=language,
+            stream=stream,
         ),
     )
     return outputs, runner.wall_clock_s
@@ -211,6 +264,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--use-existing-server", action="store_true")
     parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Use SSE streaming transcription (stream=true). Fills the "
+            "text_ttft_* and inter_chunk_* speed metrics; accuracy metrics "
+            "are computed on the final transcript as usual."
+        ),
+    )
     parser.add_argument(
         "--max-running-requests",
         type=int,
@@ -305,6 +367,7 @@ def _run_with_or_without_server(
                 request_rate=args.request_rate,
                 disable_tqdm=args.disable_tqdm,
                 request_timeout_s=args.request_timeout_s,
+                stream=args.stream,
             )
         )
         payload = _build_payload(args, samples, outputs, wall_clock_s)
@@ -337,6 +400,7 @@ def _run_with_or_without_server(
                 request_rate=args.request_rate,
                 disable_tqdm=args.disable_tqdm,
                 request_timeout_s=args.request_timeout_s,
+                stream=args.stream,
             )
         )
         payload = _build_payload(args, samples, outputs, wall_clock_s)
@@ -446,10 +510,18 @@ def _request_form(
     audio_path: Path,
     model_path: str,
     language: str | None,
+    *,
+    stream: bool = False,
 ) -> aiohttp.FormData:
     form = aiohttp.FormData()
     form.add_field("model", model_path)
-    form.add_field("response_format", "verbose_json")
+    if stream:
+        # verbose_json cannot stream; the plain text carries the same
+        # speaker/timestamp markup, which the metrics normalizer handles.
+        form.add_field("response_format", "json")
+        form.add_field("stream", "true")
+    else:
+        form.add_field("response_format", "verbose_json")
     if language:
         form.add_field("language", language)
     form.add_field(
