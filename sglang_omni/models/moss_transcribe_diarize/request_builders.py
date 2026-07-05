@@ -328,29 +328,6 @@ def make_moss_transcribe_diarize_stream_output_builder(
     eos_token_id: int | None = None,
     min_emit_interval_s: float = 0.0,
 ) -> Callable[[str, Any, Any], list[OutgoingMessage]]:
-    """Per-token stream callback emitting partial transcription text deltas.
-
-    OmniScheduler calls this on every decode step with the freshly sampled
-    token id. The MOSS-TD stage is terminal, so text deltas are emitted with
-    ``target=None`` and routed straight to the Coordinator by the stage
-    runtime. Per-request state lives on ``req`` so it is GC'd with the
-    request and survives retract/resume.
-
-    Incremental decode runs on the held pending-token buffer only (cleared on
-    every emit), which keeps per-step cost O(pending) instead of re-decoding
-    the full output each step. This is equality-safe for suffix-additive
-    tokenizers (byte-level BPE, as the Qwen3 backbone uses): concatenating
-    per-buffer decodes reproduces the full decode exactly. Incomplete UTF-8
-    sequences (trailing ``\\ufffd``) are held until a later token completes
-    them.
-
-    ``min_emit_interval_s`` rate-limits emission per request: tokens keep
-    accumulating in the pending buffer and are flushed as one delta once the
-    interval has elapsed since the last emit. The first delta and the EOS
-    flush are always immediate, so TTFT is unaffected. This bounds the
-    per-token message fan-out (outbox -> ZMQ -> coordinator -> SSE), which
-    otherwise costs measurable decode throughput at high concurrency.
-    """
     resolved_eos = (
         int(eos_token_id)
         if eos_token_id is not None
