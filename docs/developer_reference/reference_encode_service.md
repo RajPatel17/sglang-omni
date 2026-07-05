@@ -117,9 +117,12 @@ in-flight entry.
 
 ## M4a And M4b Boundary
 
-M4a is the production path: ad-hoc reference cache and same-key single-flight.
+This document covers **M4a only**: the ad-hoc reference cache and same-key
+single-flight that ships today.
 
-M4b is profile-gated: different-key batch coalescing should only be added when
-M4a profiling shows reference encode remains a bottleneck and a model has a
-real `encode_batch` speedup. M4b must still apply M4a cache hits and same-key
-single-flight before enqueueing distinct cache-miss leaders into a batch.
+**M4b (different-key batch coalescing) is not implemented and is a non-goal
+here**; it is described only to mark the scope boundary. If it is ever built, it
+would be justified only when M4a profiling shows reference encode remains a
+bottleneck and a model has a real `encode_batch` speedup, and it must still
+apply M4a cache hits and same-key single-flight before enqueueing distinct
+cache-miss leaders into a batch.
