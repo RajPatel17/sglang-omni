@@ -97,6 +97,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     enable_torch_compile: bool = False,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
+    stream_emit_interval_s: float = 0.05,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
@@ -170,6 +171,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     )
     stream_output_builder = make_moss_transcribe_diarize_stream_output_builder(
         tokenizer=tokenizer,
+        min_emit_interval_s=stream_emit_interval_s,
     )
 
     return OmniScheduler(

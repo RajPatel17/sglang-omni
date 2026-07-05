@@ -102,7 +102,7 @@ def test_silent_when_not_streaming():
 
     assert builder("req-1", rd, _make_req_output(1)) == []
     # No per-request state is created for non-streaming requests.
-    assert not hasattr(rd.req, "_moss_stream_token_ids")
+    assert not hasattr(rd.req, "_moss_stream_pending_ids")
 
 
 def test_silent_during_chunked_prefill():
@@ -209,8 +209,65 @@ def test_per_request_state_is_isolated():
     assert [m.data["text"] for m in out1] == ["A"]
     assert [m.data["text"] for m in out2] == ["B"]
     assert [m.data["text"] for m in out1b] == ["B"]
-    assert rd1.req._moss_stream_emitted_text == "AB"
-    assert rd2.req._moss_stream_emitted_text == "B"
+    # Emitted tokens leave the pending buffer; nothing lingers per request.
+    assert rd1.req._moss_stream_pending_ids == []
+    assert rd2.req._moss_stream_pending_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Rate-limited (coalesced) emission
+# ---------------------------------------------------------------------------
+
+
+def _interval_builder(vocab: dict[int, bytes], interval_s: float):
+    return make_moss_transcribe_diarize_stream_output_builder(
+        tokenizer=_ByteTokenizer(vocab),
+        min_emit_interval_s=interval_s,
+    )
+
+
+def test_min_emit_interval_first_delta_is_immediate():
+    builder = _interval_builder({1: b"A"}, interval_s=3600.0)
+    rd = _make_req_data()
+
+    msgs = builder("r", rd, _make_req_output(1))
+    assert [m.data["text"] for m in msgs] == ["A"]
+
+
+def test_min_emit_interval_holds_then_eos_flushes():
+    """Tokens within the interval are held and flushed as one delta on EOS."""
+    builder = _interval_builder({1: b"A", 2: b"B", 3: b"C"}, interval_s=3600.0)
+    rd = _make_req_data()
+
+    assert [m.data["text"] for m in builder("r", rd, _make_req_output(1))] == ["A"]
+    # Interval has not elapsed: held.
+    assert builder("r", rd, _make_req_output(2)) == []
+    assert builder("r", rd, _make_req_output(3)) == []
+
+    msgs = builder("r", rd, _make_req_output(_EOS))
+    assert [m.data["text"] for m in msgs] == ["BC"]
+
+
+def test_min_emit_interval_elapsed_flushes_batch():
+    builder = _interval_builder({1: b"A", 2: b"B", 3: b"C"}, interval_s=0.01)
+    rd = _make_req_data()
+
+    assert [m.data["text"] for m in builder("r", rd, _make_req_output(1))] == ["A"]
+    assert builder("r", rd, _make_req_output(2)) == []
+
+    import time as _time
+
+    _time.sleep(0.02)
+    msgs = builder("r", rd, _make_req_output(3))
+    assert [m.data["text"] for m in msgs] == ["BC"]
+
+
+def test_eos_with_empty_pending_emits_nothing():
+    builder = _interval_builder({1: b"A"}, interval_s=3600.0)
+    rd = _make_req_data()
+
+    assert [m.data["text"] for m in builder("r", rd, _make_req_output(1))] == ["A"]
+    assert builder("r", rd, _make_req_output(_EOS)) == []
 
 
 def test_explicit_eos_token_id_overrides_tokenizer():

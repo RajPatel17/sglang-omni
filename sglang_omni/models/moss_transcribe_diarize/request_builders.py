@@ -326,6 +326,7 @@ def make_moss_transcribe_diarize_scheduler_adapters(
 def make_moss_transcribe_diarize_stream_output_builder(
     tokenizer: Any,
     eos_token_id: int | None = None,
+    min_emit_interval_s: float = 0.0,
 ) -> Callable[[str, Any, Any], list[OutgoingMessage]]:
     """Per-token stream callback emitting partial transcription text deltas.
 
@@ -335,8 +336,20 @@ def make_moss_transcribe_diarize_stream_output_builder(
     runtime. Per-request state lives on ``req`` so it is GC'd with the
     request and survives retract/resume.
 
-    Incomplete UTF-8 sequences (trailing ``\\ufffd`` after decode) are
-    buffered until a later token completes them.
+    Incremental decode runs on the held pending-token buffer only (cleared on
+    every emit), which keeps per-step cost O(pending) instead of re-decoding
+    the full output each step. This is equality-safe for suffix-additive
+    tokenizers (byte-level BPE, as the Qwen3 backbone uses): concatenating
+    per-buffer decodes reproduces the full decode exactly. Incomplete UTF-8
+    sequences (trailing ``\\ufffd``) are held until a later token completes
+    them.
+
+    ``min_emit_interval_s`` rate-limits emission per request: tokens keep
+    accumulating in the pending buffer and are flushed as one delta once the
+    interval has elapsed since the last emit. The first delta and the EOS
+    flush are always immediate, so TTFT is unaffected. This bounds the
+    per-token message fan-out (outbox -> ZMQ -> coordinator -> SSE), which
+    otherwise costs measurable decode throughput at high concurrency.
     """
     resolved_eos = (
         int(eos_token_id)
@@ -370,31 +383,39 @@ def make_moss_transcribe_diarize_stream_output_builder(
         except (TypeError, ValueError):
             return []
 
-        token_ids = getattr(req, "_moss_stream_token_ids", None)
-        if token_ids is None:
-            token_ids = []
-            req._moss_stream_token_ids = token_ids
-        emitted = getattr(req, "_moss_stream_emitted_text", "")
+        pending = getattr(req, "_moss_stream_pending_ids", None)
+        if pending is None:
+            pending = []
+            req._moss_stream_pending_ids = pending
 
-        if resolved_eos is None or token_id != resolved_eos:
-            token_ids.append(token_id)
-        if not token_ids:
+        is_eos = resolved_eos is not None and token_id == resolved_eos
+        if not is_eos:
+            pending.append(token_id)
+        if not pending:
             return []
 
-        decoded = _decode_token_ids(tokenizer, token_ids, skip_special_tokens=True)
-        # Buffer until the trailing multi-byte char completes.
-        if decoded.endswith("\ufffd"):
+        # Rate-limit: hold tokens until the interval elapses. last_emit == 0.0
+        # means nothing was emitted yet — the first delta goes out immediately.
+        # EOS always flushes the remaining buffer.
+        now = time.perf_counter()
+        last_emit = float(getattr(req, "_moss_stream_last_emit_t", 0.0))
+        if (
+            not is_eos
+            and min_emit_interval_s > 0.0
+            and last_emit > 0.0
+            and (now - last_emit) < min_emit_interval_s
+        ):
             return []
 
-        if decoded.startswith(emitted):
-            delta = decoded[len(emitted) :]
-        else:
-            # Defensive: detokenizer rewrote earlier text — re-emit full.
-            delta = decoded
+        delta = _decode_token_ids(tokenizer, pending, skip_special_tokens=True)
+        # Hold until the trailing multi-byte char completes.
+        if delta.endswith("\ufffd"):
+            return []
+        pending.clear()
         if not delta:
             return []
 
-        req._moss_stream_emitted_text = decoded
+        req._moss_stream_last_emit_t = now
 
         return [
             OutgoingMessage(
