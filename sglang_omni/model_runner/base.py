@@ -504,15 +504,46 @@ class ModelRunner:
         host copy filled; only the latter provides host-D2H overlap. The caller
         records a CUDA event immediately after publication.
 
-        Default raises: a model must implement this together with
-        ``post_decode_resolve`` to be async-decode-safe. The synchronous
-        ``post_decode`` reads live GPU buffers that the next launch would
-        overwrite, so it cannot simply be deferred (design.md §1.6).
+        Default (plain-LM) implementation: sample on GPU now (the same
+        ``_sample_next_token_ids`` the sync path runs inside ``_finalize``),
+        then start a non-blocking D2H copy of the sampled ids into a pinned
+        ping-pong staging buffer. The base runner records the CUDA event right
+        after, so ``event.query()`` means the ids landed on the host. The
+        snapshot is required: the sampler output can alias step-reused buffers
+        that the next launch overwrites before this step's lagged resolve.
+        Runners whose decode collect is more than next_token_ids (codec models)
+        override this together with ``post_decode_resolve``.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support async decode: implement "
-            "post_decode_launch / post_decode_resolve"
-        )
+        if not requests:
+            return None
+        if result.next_token_ids is None:
+            result.next_token_ids = self._sample_next_token_ids(
+                result.logits_output, forward_batch, None, requests
+            )
+        n = len(requests)
+        ids = result.next_token_ids
+        host_buf = self._next_token_ids_host_staging(n, ids.dtype)
+        host_buf[:n].copy_(ids[:n], non_blocking=True)
+        return host_buf
+
+    def _next_token_ids_host_staging(
+        self, n: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Pinned ping-pong host buffer for the plain-LM next-token-ids
+        snapshot. Grows to the largest batch seen; two buffers so resolve(N)
+        reads one while launch(N+1)'s async copy writes the other."""
+        bufs = getattr(self, "_token_ids_host_bufs", None)
+        if bufs is None or bufs[0].numel() < n or bufs[0].dtype != dtype:
+            cap = max(n, 64)
+            bufs = [
+                torch.empty(cap, dtype=dtype, device="cpu", pin_memory=True)
+                for _ in range(2)
+            ]
+            self._token_ids_host_bufs = bufs
+            self._token_ids_host_slot = 0
+        buf = bufs[self._token_ids_host_slot]
+        self._token_ids_host_slot ^= 1
+        return buf
 
     def post_decode_resolve(
         self,
@@ -525,12 +556,15 @@ class ModelRunner:
         """Async-decode host half of ``post_decode``: read ``launch_buf`` (the
         launch's published collect, a device snapshot or pinned host staging)
         and run the per-request collect loop, setting ``result.next_token_ids``.
-        Default raises (see ``post_decode_launch``).
+
+        Default (plain-LM): point ``result.next_token_ids`` at the pinned host
+        snapshot; the caller already waited on the launch event, so the copy is
+        complete and the shared ``_finalize`` tail reads it without a GPU sync.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support async decode: implement "
-            "post_decode_launch / post_decode_resolve"
-        )
+        del forward_batch, schedule_batch
+        if launch_buf is None or not requests:
+            return
+        result.next_token_ids = launch_buf[: len(requests)]
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list

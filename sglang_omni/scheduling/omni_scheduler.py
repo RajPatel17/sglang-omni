@@ -1696,6 +1696,14 @@ class OmniScheduler:
             return
         keep = [i for i, was_finished in enumerate(pre_finished) if not was_finished]
         if len(keep) < len(batch.reqs):
+            # Free the decode slot the overrun step allocated for each dropped
+            # row: the request's own KV was already freed when it finished, and
+            # nothing else covers this extra per-step slot — leaking it drifts
+            # allocator state and breaks bit-reproducibility vs the sync loop.
+            self._free_overrun_step_slots(
+                getattr(pending_step, "forward_batch", None),
+                [i for i, was in enumerate(pre_finished) if was],
+            )
             if result.next_token_ids is not None and keep:
                 idx = torch.tensor(keep, device=result.next_token_ids.device)
                 result.next_token_ids = result.next_token_ids[idx]
@@ -1721,6 +1729,23 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
 
+    def _free_overrun_step_slots(self, forward_batch, drop_indices) -> None:
+        """Free the per-step decode KV slots allocated for rows whose request
+        already finished or retracted in a prior step (the lookahead overrun).
+
+        ``prepare_for_decode`` allocated one slot per row for this step;
+        ``cache_finished_req``/retract freed the request's own tokens only, so
+        the dropped rows' step slots would otherwise leak."""
+        if not drop_indices or forward_batch is None:
+            return
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if out_cache_loc is None or out_cache_loc.numel() < len(drop_indices):
+            return
+        idx = torch.tensor(
+            drop_indices, dtype=torch.long, device=out_cache_loc.device
+        )
+        self.token_to_kv_pool_allocator.free(out_cache_loc[idx])
+
     def _drop_stale_overrun(self, batch):
         """Drop reqs finished OR retracted by the just-completed drain from the
         stale fast-path batch, so run_batch does not forward/finalize them again
@@ -1736,6 +1761,11 @@ class OmniScheduler:
         if not any(drop):
             return batch
         keep = [i for i, d in enumerate(drop) if not d]
+        # filter_batch nulls out_cache_loc; free the dropped rows' step slots
+        # first (their requests' own KV was already freed by the drain).
+        self._free_overrun_step_slots(
+            batch, [i for i, d in enumerate(drop) if d]
+        )
         batch.filter_batch(keep_indices=keep)
         return batch if batch.reqs else None
 
