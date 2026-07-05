@@ -250,3 +250,68 @@ def test_stats_hits_misses_merged_entries_bytes() -> None:
     assert stats["merged"] == 0
     assert stats["entries"] == 1
     assert stats["bytes"] > 0
+
+
+def test_revalidate_exception_clears_inflight_and_does_not_poison() -> None:
+    # A hook whose revalidate() raises (e.g. reference file mutated mid-encode)
+    # must not strand the in-flight entry: the leader has to fail the future and
+    # drop the key so the next same-key request is a fresh leader, never a
+    # follower blocked on a dead future for the full timeout.
+    class _RaisingRevalidateHook(_TensorHook):
+        def revalidate(self, item: str, key: ReferenceEncodeKey) -> bool:
+            raise RuntimeError("revalidate boom")
+
+    hook = _RaisingRevalidateHook()
+    service = ReferenceEncodeService(hook, max_items=16, max_bytes=1024)
+
+    with pytest.raises(RuntimeError, match="revalidate boom"):
+        service.get_or_encode("k")
+    assert service.stats()["entries"] == 0
+    assert service.stats()["failed"] == 1
+    assert len(service._inflight) == 0
+
+    # New leader (not a stuck follower) -> encode runs again instead of hanging.
+    with pytest.raises(RuntimeError, match="revalidate boom"):
+        service.get_or_encode("k")
+    assert hook.calls["k"] == 2
+
+
+def test_revalidate_exception_propagates_to_followers_without_timeout() -> None:
+    # Concurrent same-key followers must receive the leader's failure promptly,
+    # not sit on follower_fut.result() until timeout_s.
+    release = threading.Event()
+    entered = threading.Event()
+
+    class _GatedRaisingHook(_TensorHook):
+        def encode_one(self, item: str) -> torch.Tensor:
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().encode_one(item)
+
+        def revalidate(self, item: str, key: ReferenceEncodeKey) -> bool:
+            raise RuntimeError("revalidate boom")
+
+    hook = _GatedRaisingHook()
+    # Large timeout: if the key were poisoned, followers would block far past the
+    # join() below, leaving their threads alive and errors incomplete.
+    service = ReferenceEncodeService(hook, max_items=16, max_bytes=1024, timeout_s=30)
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            service.get_or_encode("k", desc="k")
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(timeout=5)
+    time.sleep(0.05)
+    release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(errors) == 4
+    assert len(service._inflight) == 0

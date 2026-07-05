@@ -130,21 +130,26 @@ class ReferenceEncodeService(Generic[InputT, ArtifactT, StoredT]):
             return self._hook.load_artifact(stored)
 
         assert leader_fut is not None
+        # revalidate() and cache.put() run inside the same guard as encode: any
+        # exception here must still drop the in-flight entry and fail the future,
+        # otherwise same-key followers block on a future that never resolves and
+        # every later request for this key re-follows a dead leader (permanent
+        # poison + timeout-length hangs). A hook's revalidate() may legitimately
+        # raise (e.g. a reference file mutated during the encode window).
         try:
             artifact = self._hook.encode_one(item)
             stored = self._hook.store_artifact(artifact)
+            should_cache = self._hook.revalidate(item, key)
+            with self._lock:
+                if should_cache:
+                    self._cache.put(cache_key, stored)
+                self._inflight.pop(cache_key, None)
         except BaseException as exc:
             with self._lock:
                 self._inflight.pop(cache_key, None)
                 self._failed += 1
             leader_fut.set_exception(exc)
             raise
-
-        should_cache = self._hook.revalidate(item, key)
-        with self._lock:
-            if should_cache:
-                self._cache.put(cache_key, stored)
-            self._inflight.pop(cache_key, None)
         leader_fut.set_result(stored)
         self._maybe_log()
         return self._hook.load_artifact(stored)
