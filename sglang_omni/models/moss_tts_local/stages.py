@@ -445,7 +445,7 @@ class _MossLocalReferenceEncodeHook(
     ) -> bool:
         if item.source_kind != "path":
             return True
-        return self._input_key(item) == key.input_key
+        return _reference_path_cache_key(item.source) == key.input_key
 
     def _input_key(self, item: _MossLocalReferenceInput) -> str | None:
         if item.source_kind == "path":

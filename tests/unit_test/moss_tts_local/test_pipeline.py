@@ -395,6 +395,7 @@ def test_pipeline_stage_wiring():
     assert stages["preprocessing"].process == "pipeline"
     assert stages["preprocessing"].gpu == 0
     assert stages["preprocessing"].factory_args["device"] == "cuda:0"
+    assert stages["preprocessing"].factory_args["ref_audio_cache"] is True
     assert stages["preprocessing"].factory_args["ref_audio_cache_max_items"] == 8192
     assert config.supports_uploaded_voice_references() is True
     assert stages["tts_engine"].process == "pipeline"
@@ -431,6 +432,39 @@ def test_pipeline_stage_wiring():
     assert split_runtime.resources.total_gpu_memory_fraction is None
     assert split_runtime.sglang_server_args.mem_fraction_static == pytest.approx(0.85)
     assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
+
+
+def test_pipeline_config_injects_reference_cache_factory_args():
+    config = MossTTSLocalPipelineConfig(
+        model_path="OpenMOSS-Team/moss-local-test",
+        ref_audio_cache=False,
+        ref_audio_cache_max_items=17,
+        ref_audio_cache_max_bytes=4096,
+    )
+    preprocessing = next(
+        stage
+        for stage in config.stages
+        if stage.factory.endswith("create_preprocessing_executor")
+    )
+
+    assert preprocessing.factory_args["ref_audio_cache"] is False
+    assert preprocessing.factory_args["ref_audio_cache_max_items"] == 17
+    assert preprocessing.factory_args["ref_audio_cache_max_bytes"] == 4096
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"ref_audio_cache_max_items": 0}, "ref_audio_cache_max_items"),
+        ({"ref_audio_cache_max_bytes": 0}, "ref_audio_cache_max_bytes"),
+    ],
+)
+def test_pipeline_config_rejects_invalid_reference_cache_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        MossTTSLocalPipelineConfig(
+            model_path="OpenMOSS-Team/moss-local-test",
+            **kwargs,
+        )
 
 
 def _install_fake_moss_ar_factory(
@@ -1502,6 +1536,45 @@ def test_cached_reference_encoder_duration_gate(tmp_path, monkeypatch):
     assert encode_count == 0, "oversized reference must not reach the codec"
     assert enc.stats()["entries"] == 0
     assert len(enc._service._inflight) == 0
+
+
+def test_cached_reference_encoder_revalidate_skips_duration_gate(
+    tmp_path, monkeypatch
+):
+    from sglang_omni.models.moss_tts_local.stages import _MossLocalReferenceEncoder
+
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"revalidate reference")
+    info_calls = 0
+
+    class _FakeInfo:
+        num_frames = 48000
+        sample_rate = 48000
+
+    def info(path):
+        nonlocal info_calls
+        assert path == str(ref)
+        info_calls += 1
+        if info_calls > 1:
+            raise ValueError("duration gate should not run during revalidate")
+        return _FakeInfo()
+
+    monkeypatch.setitem(sys.modules, "torchaudio", types.SimpleNamespace(info=info))
+
+    class _FakeBatched:
+        def encode(self, path: str) -> torch.Tensor:
+            assert path == str(ref)
+            return torch.zeros((5, N_VQ), dtype=torch.long)
+
+    enc = _MossLocalReferenceEncoder(
+        _FakeBatched(), n_vq=N_VQ, max_items=256, max_bytes=64 << 20
+    )
+
+    result = enc.encode(str(ref))
+
+    assert torch.equal(result, torch.zeros((5, N_VQ), dtype=torch.long))
+    assert info_calls == 1
+    assert enc.stats()["entries"] == 1
 
 
 # Data-URI reference path
