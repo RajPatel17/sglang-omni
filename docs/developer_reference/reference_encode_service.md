@@ -121,8 +121,36 @@ This document covers **M4a only**: the ad-hoc reference cache and same-key
 single-flight that ships today.
 
 **M4b (different-key batch coalescing) is not implemented and is a non-goal
-here**; it is described only to mark the scope boundary. If it is ever built, it
-would be justified only when M4a profiling shows reference encode remains a
-bottleneck and a model has a real `encode_batch` speedup, and it must still
-apply M4a cache hits and same-key single-flight before enqueueing distinct
-cache-miss leaders into a batch.
+here**; it is described only to mark the scope boundary. Do not add M4b runtime
+code until profiling proves it is worth the extra scheduling surface.
+
+Before building M4b, run cold-cache workloads with different reference audio per
+request at concurrency 8 and 16 for FishAudio S2-Pro, Qwen3-TTS, and
+MOSS-TTS Local. Track preprocessing/reference-encode p50/p95, end-to-end TTFA
+and latency, throughput, cache hit/miss/merge counts, and GPU/CPU utilization.
+Build M4b for a model only if different-key reference encode remains a top
+bottleneck and batching gives at least 15% p95 latency reduction or 20%
+throughput improvement versus M4a.
+
+If M4b is built later, it should be an opt-in extension of
+`ReferenceEncodeService`, not the default path:
+
+- add explicit hook capability, for example `can_encode_batch()` defaulting to
+  `False`, and call `encode_batch(items)` only for hooks that opt in;
+- add service knobs such as `max_batch_size=1` and `max_batch_wait_ms=0`;
+- preserve M4a ordering: normalize input, compute cache key, check cache,
+  merge same-key inflight work, and only then enqueue distinct cache-miss
+  leaders for different-key batching;
+- use an internal queue that drains up to `max_batch_size` or
+  `max_batch_wait_ms`, calls one hook batch encode, and then stores,
+  revalidates, cache-inserts, and resolves each item independently;
+- on a batch failure, retry per item so one bad reference does not fail the
+  whole batch.
+
+Model rollout should stay evidence-driven. MOSS-TTS Local already has its own
+batched reference encoder and should not be migrated just to fit this generic
+surface. FishAudio S2-Pro is the first plausible candidate only if profiling
+shows real benefit; its batched path would decode/resample each reference, pad
+waveforms, call the codec once, and split outputs while preserving parity with
+`encode_one`. Qwen3-TTS should remain M4a-only unless the upstream wrapper
+exposes a safe batch primitive for `create_voice_clone_prompt`.
