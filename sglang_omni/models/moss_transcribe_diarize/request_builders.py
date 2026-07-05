@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.utils.audio import audio_fingerprint, audio_fingerprint_int, load_audio
 
@@ -322,10 +323,101 @@ def make_moss_transcribe_diarize_scheduler_adapters(
     return request_builder, result_adapter
 
 
+def make_moss_transcribe_diarize_stream_output_builder(
+    tokenizer: Any,
+    eos_token_id: int | None = None,
+) -> Callable[[str, Any, Any], list[OutgoingMessage]]:
+    """Per-token stream callback emitting partial transcription text deltas.
+
+    OmniScheduler calls this on every decode step with the freshly sampled
+    token id. The MOSS-TD stage is terminal, so text deltas are emitted with
+    ``target=None`` and routed straight to the Coordinator by the stage
+    runtime. Per-request state lives on ``req`` so it is GC'd with the
+    request and survives retract/resume.
+
+    Incomplete UTF-8 sequences (trailing ``\\ufffd`` after decode) are
+    buffered until a later token completes them.
+    """
+    resolved_eos = (
+        int(eos_token_id)
+        if eos_token_id is not None
+        else (
+            int(tokenizer.eos_token_id)
+            if getattr(tokenizer, "eos_token_id", None) is not None
+            else None
+        )
+    )
+
+    def _build_stream_output(
+        request_id: str, req_data: Any, req_output: Any
+    ) -> list[OutgoingMessage]:
+        req = getattr(req_data, "req", None)
+        if req is None or req_output.data is None:
+            return []
+        # While chunked prefill is still consuming prompt tokens, suppress
+        # emission — prompt-side states would masquerade as output text.
+        if int(getattr(req, "is_chunked", 0) or 0) > 0:
+            return []
+
+        stage_payload = getattr(req_data, "stage_payload", None)
+        if stage_payload is None:
+            return []
+        if not bool((stage_payload.request.params or {}).get("stream", False)):
+            return []
+
+        try:
+            token_id = int(req_output.data)
+        except (TypeError, ValueError):
+            return []
+
+        token_ids = getattr(req, "_moss_stream_token_ids", None)
+        if token_ids is None:
+            token_ids = []
+            req._moss_stream_token_ids = token_ids
+        emitted = getattr(req, "_moss_stream_emitted_text", "")
+
+        if resolved_eos is None or token_id != resolved_eos:
+            token_ids.append(token_id)
+        if not token_ids:
+            return []
+
+        decoded = _decode_token_ids(tokenizer, token_ids, skip_special_tokens=True)
+        # Buffer until the trailing multi-byte char completes.
+        if decoded.endswith("\ufffd"):
+            return []
+
+        if decoded.startswith(emitted):
+            delta = decoded[len(emitted) :]
+        else:
+            # Defensive: detokenizer rewrote earlier text — re-emit full.
+            delta = decoded
+        if not delta:
+            return []
+
+        req._moss_stream_emitted_text = decoded
+
+        return [
+            OutgoingMessage(
+                request_id=request_id,
+                type="stream",
+                target=None,  # terminal stage → Coordinator
+                data={
+                    "text": delta,
+                    "modality": "text",
+                    "stage_name": "asr",
+                },
+                metadata={"modality": "text", "token_id": token_id},
+            )
+        ]
+
+    return _build_stream_output
+
+
 __all__ = [
     "DEFAULT_TRANSCRIBE_DIARIZE_PROMPT",
     "MossTranscribeDiarizeRequestData",
     "load_audio",
     "make_moss_transcribe_diarize_scheduler_adapters",
+    "make_moss_transcribe_diarize_stream_output_builder",
     "postprocess_moss_transcribe_diarize_text",
 ]
