@@ -163,6 +163,7 @@ def test_exception_propagates_to_all_waiters_and_does_not_poison() -> None:
     assert len(errors) == 4
     assert all(isinstance(error, ValueError) for error in errors)
     assert all(str(error) == "boom" for error in errors)
+    assert len({id(error) for error in errors}) == len(errors)
     assert service.stats()["entries"] == 0
     result = service.get_or_encode("flaky")
     assert torch.equal(result, torch.tensor([9], dtype=torch.long))

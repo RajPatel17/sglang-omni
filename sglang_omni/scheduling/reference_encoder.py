@@ -55,6 +55,16 @@ class ReferenceEncodeHook(Generic[InputT, ArtifactT, StoredT]):
         return [self.encode_one(item) for item in items]
 
 
+def _fresh_exception(exc: BaseException) -> BaseException:
+    try:
+        fresh = type(exc)(*getattr(exc, "args", ()))
+    except Exception:
+        fresh = RuntimeError(str(exc))
+    for note in getattr(exc, "__notes__", ()):
+        fresh.add_note(note)
+    return fresh
+
+
 class ReferenceEncodeService(Generic[InputT, ArtifactT, StoredT]):
     _LOG_INTERVAL_S = 60.0
 
@@ -122,6 +132,8 @@ class ReferenceEncodeService(Generic[InputT, ArtifactT, StoredT]):
                 stored = follower_fut.result(timeout=self._timeout_s)
             except concurrent.futures.TimeoutError:
                 raise
+            except BaseException as exc:
+                raise _fresh_exception(exc) from exc
             return self._hook.load_artifact(stored)
 
         assert leader_fut is not None
