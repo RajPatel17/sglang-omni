@@ -133,7 +133,6 @@ class Qwen3TTSPreparedRequest:
 class Qwen3TTSPreprocessingContext:
     model: Any
     wrapper: Any
-    adhoc_reference_service: ReferenceEncodeService | None = None
 
 
 _PREPROCESSING_CONTEXT: Qwen3TTSPreprocessingContext | None = None
@@ -148,11 +147,10 @@ def set_qwen3_tts_preprocessing_context(*, model: Any, wrapper: Any) -> None:
 
     global _PREPROCESSING_CONTEXT
     with _PREPARED_REQUESTS_LOCK:
-        service = _get_qwen3_tts_adhoc_reference_service_locked(model, wrapper)
+        _get_qwen3_tts_adhoc_reference_service_locked(model, wrapper)
         _PREPROCESSING_CONTEXT = Qwen3TTSPreprocessingContext(
             model=model,
             wrapper=wrapper,
-            adhoc_reference_service=service,
         )
         _PREPARED_REQUESTS.clear()
 
