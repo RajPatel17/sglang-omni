@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -93,6 +94,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     context_length: int | None = None,
     mem_fraction_static: float | None = 0.80,
     mm_embedding_cache_size_bytes: int = 0,
+    encoder_cache_size_bytes: int = 0,
     enable_torch_compile: bool = False,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
@@ -155,7 +157,25 @@ def create_sglang_moss_transcribe_diarize_executor(
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
 
+    env_toggle = os.environ.get("MOSS_ENCODER_CACHE")
+    if env_toggle is not None and env_toggle.strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    ):
+        encoder_cache_size_bytes = 0
+
+    # SGLang's mm embedding cache (GPU) and this encoder cache (CPU) would
+    # double-cache the same audio, so allow at most one.
+    if mm_embedding_cache_size_bytes and encoder_cache_size_bytes:
+        raise ValueError(
+            "Enable at most one of mm_embedding_cache_size_bytes (SGLang GPU "
+            "cache) and encoder_cache_size_bytes (MOSS CPU encoder cache)."
+        )
     init_mm_embedding_cache(mm_embedding_cache_size_bytes)
+    model_worker.model_runner.model.init_encoder_cache(encoder_cache_size_bytes)
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
