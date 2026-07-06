@@ -487,13 +487,30 @@ class ModelRunner:
         """Whether this batch may use one-step async-decode lookahead.
 
         The default ``post_decode_launch`` samples at launch time, one step
-        before resolve appends the previous token to host ``req.output_ids``,
-        so ``_apply_repetition_penalty`` would read a one-token-stale history
-        and systematically diverge from the sync path — route those batches
-        synchronously. A runner whose collect has other sync-only fallbacks
-        overrides this. The scheduler's async gate consults it.
+        before resolve appends the previous token to host ``req.output_ids``
+        (and before ``process_batch_result`` cumulates it into the sglang
+        sampler's penalizer state). So *any* sampling term that scores by
+        output history reads a one-token-stale view and systematically diverges
+        from the sync path: repetition penalty (applied here in
+        ``_apply_repetition_penalty`` off ``req.output_ids``) plus the sglang
+        penalizers — frequency / presence penalty and ``min_new_tokens`` EOS
+        suppression. Route any batch that sets one of these synchronously. The
+        gate's semantics are "this batch's sampling does not depend on output
+        history at all", not "repetition_penalty happens to be off"; over-gating
+        only costs throughput, under-gating is a silent divergence. A runner
+        whose collect has other sync-only fallbacks overrides this. The
+        scheduler's async gate consults it.
         """
-        return all(req.sampling_params.repetition_penalty == 1.0 for req in batch.reqs)
+
+        def _history_free(sp: Any) -> bool:
+            return (
+                sp.repetition_penalty == 1.0
+                and sp.frequency_penalty == 0.0
+                and sp.presence_penalty == 0.0
+                and sp.min_new_tokens == 0
+            )
+
+        return all(_history_free(req.sampling_params) for req in batch.reqs)
 
     def post_process_outputs(
         self,

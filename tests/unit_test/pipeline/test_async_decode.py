@@ -221,27 +221,42 @@ def test_resolve_skips_retracted_row():
     assert r.last_skip_rids == {"retracted"}
 
 
-def test_base_lookahead_eligible_gates_repetition_penalty():
+def test_base_lookahead_eligible_gates_output_history_sampling():
     """The base default launch samples with host ``req.output_ids`` one step
-    stale, so ``repetition_penalty != 1.0`` would systematically diverge from
-    the sync path — those batches must route synchronously. The scheduler's
-    async gate consults this alongside the min-batch-size / is-decode checks.
+    stale (and before the sglang penalizer state is cumulated), so any
+    output-history-dependent sampling term — repetition / frequency / presence
+    penalty, or ``min_new_tokens`` EOS suppression — would systematically
+    diverge from the sync path. Those batches must route synchronously. The
+    scheduler's async gate consults this alongside the min-batch-size /
+    is-decode checks.
     """
 
-    def _batch(penalties):
+    def _sp(**overrides):
+        params = dict(
+            repetition_penalty=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            min_new_tokens=0,
+        )
+        params.update(overrides)
+        return types.SimpleNamespace(**params)
+
+    def _batch(*sampling_params):
         return types.SimpleNamespace(
-            reqs=[
-                types.SimpleNamespace(
-                    sampling_params=types.SimpleNamespace(repetition_penalty=p)
-                )
-                for p in penalties
-            ]
+            reqs=[types.SimpleNamespace(sampling_params=sp) for sp in sampling_params]
         )
 
     r = _StubRunner()
-    assert r.lookahead_eligible(_batch([])) is True
-    assert r.lookahead_eligible(_batch([1.0, 1.0])) is True
-    assert r.lookahead_eligible(_batch([1.0, 1.05])) is False
+    # Empty batch and all-history-free rows are eligible.
+    assert r.lookahead_eligible(_batch()) is True
+    assert r.lookahead_eligible(_batch(_sp(), _sp())) is True
+    # Any output-history-dependent term on any row forces sync.
+    assert r.lookahead_eligible(_batch(_sp(repetition_penalty=1.05))) is False
+    assert r.lookahead_eligible(_batch(_sp(frequency_penalty=0.5))) is False
+    assert r.lookahead_eligible(_batch(_sp(presence_penalty=0.5))) is False
+    assert r.lookahead_eligible(_batch(_sp(min_new_tokens=4))) is False
+    # A single tainted row taints the whole batch.
+    assert r.lookahead_eligible(_batch(_sp(), _sp(frequency_penalty=0.1))) is False
 
 
 def test_finalize_skips_overrun_bookkeeping_and_extras():

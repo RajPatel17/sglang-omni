@@ -94,7 +94,8 @@ def create_sglang_moss_transcribe_diarize_executor(
     mem_fraction_static: float | None = 0.80,
     mm_embedding_cache_size_bytes: int = 0,
     enable_torch_compile: bool = False,
-    enable_async_decode: bool = False,
+    # note (yichi): async on by default for MOSS-TD; --decode-mode sync to opt out.
+    enable_async_decode: bool = True,
     async_decode_min_batch_size: int = 2,
     request_build_max_workers: int = 2,
     request_build_max_pending: int | None = 16,
