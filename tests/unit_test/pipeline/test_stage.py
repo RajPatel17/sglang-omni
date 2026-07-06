@@ -261,18 +261,30 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
         stream_relay = FakeRelay(log=log)
         control_plane = RecordingStageControlPlane()
         control_plane.log = log
-        await stage_io.send_stream_chunk(
+        stream_ref, stream_ops = await stage_io.write_stream_chunk(
             stream_relay,
-            control_plane,
             request_id="req-1",
             data=torch.tensor([1, 2, 3]),
             target_stage="talker",
-            target_endpoint="inproc://talker",
             from_stage="thinker",
             chunk_id=0,
             metadata={"token_id": 1, "hidden": torch.tensor([4])},
             transport=TransportKind.SHM,
         )
+        await control_plane.send_to_stage(
+            "talker",
+            "inproc://talker",
+            DataReadyMessage(
+                request_id="req-1",
+                from_stage="thinker",
+                to_stage="talker",
+                data_ref=stream_ref.to_dict(),
+                chunk_id=0,
+            ),
+        )
+        for op in stream_ops:
+            op.mark_receiver_done()
+            await op.wait_for_completion()
 
         names = collect_event_names(log)
         assert names.index("stage_cp_send_to_stage") < names.index("op_wait")
@@ -290,7 +302,11 @@ def test_stage_relay_read_failure_completes_with_error() -> None:
     async def _run() -> None:
         relay = FakeRelay()
         control_plane = RecordingStageControlPlane()
-        stage_obj = make_stage(relay=relay, control_plane=control_plane)
+        stage_obj = make_stage(
+            relay=relay,
+            control_plane=control_plane,
+            endpoints={"upstream": "inproc://upstream"},
+        )
         payload = make_stage_payload(request_id="req-1")
         data_ref, _ = await stage_io.write_payload(
             relay,
@@ -945,6 +961,20 @@ def test_stage_preserves_relay_order_when_target_also_receives_stream() -> None:
         ]
         assert control_plane.sent_to_stage[1][2].chunk_id is None
         assert relay.storage
+
+    asyncio.run(_run())
+
+
+def test_stage_payload_send_requires_endpoint() -> None:
+    async def _run() -> None:
+        sender = make_stage(name="thinker", endpoints={})
+
+        with pytest.raises(RuntimeError, match="no endpoint configured"):
+            await sender._send_to_stage(
+                "req-1",
+                "decode",
+                make_stage_payload(request_id="req-1"),
+            )
 
     asyncio.run(_run())
 

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import mmap
 import os
-import tempfile
 import uuid
 from typing import Any, Callable
 
@@ -140,43 +138,6 @@ def _load_cuda_storage_handle(
     )
 
 
-class _AckMap:
-    def __init__(self, path: str, size: int, *, owner: bool) -> None:
-        self.path = path
-        self.owner = owner
-        self._closed = False
-        if owner:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            os.ftruncate(fd, size)
-        else:
-            fd = os.open(path, os.O_RDWR)
-        self.fd = fd
-        self.map = mmap.mmap(fd, size)
-
-    def clear(self, index: int) -> None:
-        self.map[index : index + 1] = b"\x00"
-
-    def mark_done(self, index: int) -> None:
-        self.map[index : index + 1] = b"\x01"
-
-    def is_done(self, index: int) -> bool:
-        return self.map[index] == 1
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self.map.close()
-        finally:
-            os.close(self.fd)
-            if self.owner:
-                try:
-                    os.unlink(self.path)
-                except FileNotFoundError:
-                    pass
-
-
 class CudaIpcPutOperation(RelayOperation):
     """Sender-side handle; completion means the slot can be reused."""
 
@@ -186,8 +147,7 @@ class CudaIpcPutOperation(RelayOperation):
         *,
         ready_event: torch.cuda.Event,
         source_tensor: torch.Tensor,
-        ack_map: _AckMap,
-        ack_index: int,
+        slot_index: int,
         request_id: str | None,
         size: int,
         release_cb: Callable[[], None],
@@ -196,13 +156,13 @@ class CudaIpcPutOperation(RelayOperation):
         self._metadata = metadata
         self._ready_event: torch.cuda.Event | None = ready_event
         self._source_tensor: torch.Tensor | None = source_tensor
-        self._ack_map = ack_map
-        self._ack_index = ack_index
+        self._slot_index = slot_index
         self._request_id = request_id
         self._size = size
         self._release_cb = release_cb
         self._fail_cb = fail_cb
         self._completed = False
+        self._receiver_done = asyncio.get_running_loop().create_future()
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -212,33 +172,15 @@ class CudaIpcPutOperation(RelayOperation):
         if self._completed:
             return
         wait_start = _comm_now_ns()
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
-        # The spin+backoff helper below is an interim fix for the busy-spin only;
-        # the sender still polls a shared-mmap ack byte. The end-state is a truly
-        # event-driven wait, via one of two routes:
-        #   - eventfd + loop.add_reader (preferred): the receiver writes the
-        #     eventfd and the event loop wakes this coroutine directly -- zero CPU,
-        #     no helper thread, and a closed fd surfaces peer death immediately.
-        #     Cost: an eventfd is a raw fd, so it must be handed across the process
-        #     boundary (fork-inherit, or SCM_RIGHTS over a unix socket).
-        #   - named pipe (FIFO): path-based like today's ack file (no fd-passing),
-        #     and a pipe read is likewise add_reader-drivable. Slightly heavier
-        #     than eventfd and needs FIFO lifecycle management.
-        # TODO(comm): replace the shared-mmap ack poll with an eventfd + add_reader
-        # (falling back to a named pipe only if fd-passing is impractical) so the
-        # sender blocks event-driven with zero CPU and prompt peer-death detection,
-        # instead of this spin+backoff and the blunt 30s timeout.
         try:
-            polls = await _await_ready(
-                lambda: self._ack_map.is_done(self._ack_index),
-                deadline=deadline,
-                loop=loop,
-                timeout_message="cuda_ipc receiver did not ack slot in time",
-            )
+            await asyncio.wait_for(self._receiver_done, timeout=timeout)
         except TimeoutError as exc:
-            # Timeout is a hard relay failure; do not return a possibly live slot
-            # to normal traffic.
+            self._completed = True
+            self._fail_cb(exc)
+            self._source_tensor = None
+            self._ready_event = None
+            raise
+        except Exception as exc:
             self._completed = True
             self._fail_cb(exc)
             self._source_tensor = None
@@ -251,29 +193,34 @@ class CudaIpcPutOperation(RelayOperation):
         _comm_trace(
             "cuda_ipc_put_wait_ack",
             request_id=self._request_id,
-            ack_index=self._ack_index,
+            slot_index=self._slot_index,
             bytes=self._size,
-            polls=polls,
             elapsed_ms=round(_comm_elapsed_ms(wait_start), 6),
         )
 
+    def mark_receiver_done(self) -> None:
+        if not self._receiver_done.done():
+            self._receiver_done.set_result(None)
+
+    def mark_receiver_failed(self, exc: BaseException) -> None:
+        if not self._receiver_done.done():
+            self._receiver_done.set_exception(exc)
+
 
 class CudaIpcGetOperation(RelayOperation):
-    """Receiver-side handle. Acks the sender slot after the peer copy finishes."""
+    """Receiver-side handle. Completion means the peer copy finished."""
 
     def __init__(
         self,
         event: torch.cuda.Event,
         pool_tensor: torch.Tensor,
-        ack_map: _AckMap,
-        ack_index: int,
+        slot_index: int,
         request_id: str | None,
         size: int,
     ) -> None:
         self._event = event
         self._pool_tensor: torch.Tensor | None = pool_tensor
-        self._ack_map = ack_map
-        self._ack_index = ack_index
+        self._slot_index = slot_index
         self._request_id = request_id
         self._size = size
         self._completed = False
@@ -295,12 +242,11 @@ class CudaIpcGetOperation(RelayOperation):
             timeout_message="cuda_ipc copy did not complete in time",
         )
         self._completed = True
-        self._ack_map.mark_done(self._ack_index)
         self._pool_tensor = None
         _comm_trace(
             "cuda_ipc_get_wait_copy",
             request_id=self._request_id,
-            ack_index=self._ack_index,
+            slot_index=self._slot_index,
             bytes=self._size,
             polls=polls,
             elapsed_ms=round(_comm_elapsed_ms(wait_start), 6),
@@ -340,10 +286,8 @@ class CudaIpcRelay(Relay):
         self._pool_id: str | None = None
         self._pool_storage_handle: dict[str, Any] | None = None
         self._allocator: CreditAllocator | None = None
-        self._ack_map: _AckMap | None = None
 
         self._remote_pools: dict[str, torch.Tensor] = {}
-        self._remote_acks: dict[str, _AckMap] = {}
         self._failed_error: BaseException | None = None
         self._failed_event = asyncio.Event()
 
@@ -376,10 +320,6 @@ class CudaIpcRelay(Relay):
             slot_size=self.slot_size,
             base_ptr=self._pool_tensor.data_ptr(),
         )
-        ack_path = os.path.join(
-            tempfile.gettempdir(), f"sglang_omni_cuda_ipc_{uuid.uuid4().hex}.ack"
-        )
-        self._ack_map = _AckMap(ack_path, self.credits, owner=True)
         _comm_trace(
             "cuda_ipc_pool_alloc",
             engine_id=self.engine_id,
@@ -392,13 +332,12 @@ class CudaIpcRelay(Relay):
 
     def _local_pool_state(
         self,
-    ) -> tuple[torch.Tensor, str, dict[str, Any], CreditAllocator, _AckMap]:
+    ) -> tuple[torch.Tensor, str, dict[str, Any], CreditAllocator]:
         self._ensure_local_pool()
         pool_tensor = self._pool_tensor
         pool_id = self._pool_id
         pool_storage_handle = self._pool_storage_handle
         allocator = self._allocator
-        ack_map = self._ack_map
         if pool_tensor is None:
             raise RuntimeError("cuda_ipc local pool tensor was not initialized")
         if pool_id is None:
@@ -407,9 +346,7 @@ class CudaIpcRelay(Relay):
             raise RuntimeError("cuda_ipc local pool storage handle was not initialized")
         if allocator is None:
             raise RuntimeError("cuda_ipc local credit allocator was not initialized")
-        if ack_map is None:
-            raise RuntimeError("cuda_ipc local ack map was not initialized")
-        return pool_tensor, pool_id, pool_storage_handle, allocator, ack_map
+        return pool_tensor, pool_id, pool_storage_handle, allocator
 
     def _mark_failed(self, exc: BaseException) -> None:
         if self._failed_error is None:
@@ -467,15 +404,6 @@ class CudaIpcRelay(Relay):
             self._remote_pools[pool_id] = pool
         return pool
 
-    def _get_remote_ack(self, metadata: dict[str, Any]) -> _AckMap:
-        ipc_meta = metadata["cuda_ipc"]
-        ack_path = ipc_meta["ack_path"]
-        ack = self._remote_acks.get(ack_path)
-        if ack is None:
-            ack = _AckMap(ack_path, int(ipc_meta["credits"]), owner=False)
-            self._remote_acks[ack_path] = ack
-        return ack
-
     async def put_async(
         self,
         tensor: torch.Tensor,
@@ -493,7 +421,6 @@ class CudaIpcRelay(Relay):
             pool_id,
             pool_storage_handle,
             allocator,
-            ack_map,
         ) = self._local_pool_state()
 
         flat = tensor.contiguous().view(torch.uint8).reshape(-1)
@@ -507,7 +434,6 @@ class CudaIpcRelay(Relay):
         offset = await self._acquire_slot(allocator)
         acquire_ms = _comm_elapsed_ms(acquire_start)
         slot_index = int(offset // self.slot_size)
-        ack_map.clear(slot_index)
 
         try:
             copy_start = _comm_now_ns()
@@ -550,17 +476,13 @@ class CudaIpcRelay(Relay):
                 "pool_storage": pool_storage_handle,
                 "src_device_id": self.device_id,
                 "ready_event": ready_handle,
-                "ack_path": ack_map.path,
-                "ack_index": slot_index,
-                "credits": self.credits,
             },
         }
         return CudaIpcPutOperation(
             metadata,
             ready_event=ready_event,
             source_tensor=flat,
-            ack_map=ack_map,
-            ack_index=slot_index,
+            slot_index=slot_index,
             request_id=request_id,
             size=size,
             release_cb=lambda: allocator.release(offset),
@@ -584,9 +506,6 @@ class CudaIpcRelay(Relay):
         pool_start = _comm_now_ns()
         pool_tensor = self._get_remote_pool(metadata, device=dst_device)
         pool_ms = _comm_elapsed_ms(pool_start)
-        ack_start = _comm_now_ns()
-        ack_map = self._get_remote_ack(metadata)
-        ack_ms = _comm_elapsed_ms(ack_start)
 
         src_index = int(ipc_meta["src_device_id"])
         dst_index = int(dst_device.index or 0)
@@ -610,7 +529,7 @@ class CudaIpcRelay(Relay):
 
         size = int(metadata["transfer_info"]["size"])
         offset = int(metadata["transfer_info"]["offset"])
-        ack_index = int(ipc_meta["ack_index"])
+        slot_index = int(metadata["transfer_info"]["slot_index"])
         # Import on the waiting device; source-device imports can hang cross-GPU.
         event_start = _comm_now_ns()
         ready_event = torch.cuda.Event.from_ipc_handle(
@@ -643,9 +562,8 @@ class CudaIpcRelay(Relay):
             dst_device=dst_index,
             bytes=size,
             copy_len=int(copy_len),
-            ack_index=ack_index,
+            slot_index=slot_index,
             pool_open_ms=round(pool_ms, 6),
-            ack_open_ms=round(ack_ms, 6),
             peer_access_ms=round(peer_ms, 6),
             event_import_ms=round(event_ms, 6),
             copy_enqueue_ms=round(copy_enqueue_ms, 6),
@@ -654,8 +572,7 @@ class CudaIpcRelay(Relay):
         return CudaIpcGetOperation(
             event,
             pool_tensor,
-            ack_map,
-            ack_index,
+            slot_index,
             request_id=request_id,
             size=size,
         )
@@ -664,13 +581,7 @@ class CudaIpcRelay(Relay):
         pass
 
     def close(self) -> None:
-        for ack in self._remote_acks.values():
-            ack.close()
-        self._remote_acks.clear()
         self._remote_pools.clear()
-        if self._ack_map is not None:
-            self._ack_map.close()
-            self._ack_map = None
         self._pool_tensor = None
         self._pool_storage_handle = None
         self._allocator = None

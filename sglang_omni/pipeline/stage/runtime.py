@@ -35,6 +35,7 @@ from sglang_omni.proto import (
     AdminResult,
     AdminResultMessage,
     CompleteMessage,
+    DataAckMessage,
     DataReadyMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
@@ -51,6 +52,10 @@ logger = logging.getLogger(__name__)
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+
+
+def _error_text(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
 
 
 class Stage:
@@ -120,7 +125,8 @@ class Stage:
                 remote_stage_names=remote_stage_names or set(),
                 comm_config=comm_config or {},
                 injected_relay=relay,
-            )
+            ),
+            task_done_callback=self._on_background_task_done,
         )
 
         self._running = False
@@ -131,6 +137,7 @@ class Stage:
         self._first_stream_chunk_seen: set[str] = set()
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
+        self._receive_tasks: set[asyncio.Task] = set()
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
@@ -182,6 +189,12 @@ class Stage:
 
     async def stop(self) -> None:
         self._running = False
+        receive_tasks = list(self._receive_tasks)
+        for task in receive_tasks:
+            task.cancel()
+        for task in receive_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
         if self.scheduler is not None:
             self.scheduler.stop()
         self.control_plane.close()
@@ -248,19 +261,33 @@ class Stage:
     async def _handle_message(self, msg: Any) -> None:
         if isinstance(msg, SubmitMessage):
             await self._on_submit(msg)
+        elif isinstance(msg, DataAckMessage):
+            self._comm.ack_transfer(msg)
         elif isinstance(msg, DataReadyMessage):
             if msg.is_done or msg.error:
                 await self._on_stream_signal(msg)
             elif msg.chunk_id is not None:
-                await self._on_stream_chunk(msg)
+                self._schedule_receive_task(
+                    self._on_stream_chunk(msg),
+                    f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}",
+                )
             else:
-                await self._on_data_ready(msg)
+                self._schedule_receive_task(
+                    self._on_data_ready(msg),
+                    f"payload {msg.request_id}:{msg.from_stage}",
+                )
         elif isinstance(msg, ProfilerStartMessage):
             self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
             self._on_profiler_stop(msg)
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
+
+    def _schedule_receive_task(self, coro: Any, label: str) -> None:
+        task = asyncio.create_task(coro)
+        self._receive_tasks.add(task)
+        task.add_done_callback(self._receive_tasks.discard)
+        task.add_done_callback(lambda done: self._on_background_task_done(done, label))
 
     async def _on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id
@@ -300,9 +327,13 @@ class Stage:
             logger.exception(
                 "Stage %s: relay read failed for %s", self.name, request_id
             )
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
             relay.cleanup(request_id)
             await self._send_failure(request_id, f"relay read failed: {exc}")
             return
+        await self._send_data_ack(msg, data_ref, success=True)
 
         await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
 
@@ -405,8 +436,12 @@ class Stage:
                 request_id,
                 exc,
             )
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
             await self._queue_stream_error(request_id, msg.from_stage, exc)
             return
+        await self._send_data_ack(msg, data_ref, success=True)
 
         if request_id in self._aborted:
             return
@@ -479,39 +514,76 @@ class Stage:
             raise ValueError("data_ready message is missing transfer data_ref")
         return DataRef.from_dict(msg.data_ref)
 
+    async def _send_data_ack(
+        self,
+        msg: DataReadyMessage,
+        data_ref: DataRef,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        endpoint = self.endpoints.get(msg.from_stage)
+        if endpoint is None:
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for ack target "
+                f"{msg.from_stage!r}"
+            )
+        await self.control_plane.send_to_stage(
+            msg.from_stage,
+            endpoint,
+            DataAckMessage(
+                request_id=msg.request_id,
+                from_stage=self.name,
+                to_stage=msg.from_stage,
+                object_id=data_ref.object_id,
+                success=success,
+                error=error,
+            ),
+        )
+
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         request_id = msg.request_id
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            data_ref = self._data_ref_from_message(msg)
-            relay = self._comm.relay(data_ref.transport)
             await self._comm.read_payload(
                 relay=relay,
                 request_id=request_id,
                 data_ref=data_ref,
             )
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "Stage %s: failed to drain aborted payload for %s",
                 self.name,
                 request_id,
                 exc_info=True,
             )
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
             self._comm.cleanup(request_id)
+            return
+        await self._send_data_ack(msg, data_ref, success=True)
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
         if msg.chunk_id is None:
-            return
+            raise ValueError("stream chunk discard requires chunk_id")
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            data_ref = self._data_ref_from_message(msg)
-            relay = self._comm.relay(data_ref.transport)
             await self._comm.read_stream_chunk(relay=relay, data_ref=data_ref)
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "Stage %s: failed to drain aborted stream chunk for %s",
                 self.name,
                 msg.request_id,
                 exc_info=True,
             )
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
+            return
+        await self._send_data_ack(msg, data_ref, success=True)
 
     async def _on_stream_signal(self, msg: DataReadyMessage) -> None:
         await self._receive_stream_signal(
@@ -859,8 +931,9 @@ class Stage:
             )
         endpoint = self.endpoints.get(target)
         if endpoint is None:
-            logger.warning("Stage %s: no endpoint for %s", self.name, target)
-            return
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for target {target!r}"
+            )
         projector = self._project_payload.get(target)
         projected_payload = projector(payload) if projector is not None else payload
         use_local_object = allow_local_object or (
@@ -905,25 +978,18 @@ class Stage:
             )
             return
 
-        if target in self._same_process_targets:
-            transport_kind, relay = self._comm.router.relay_for_materialized_payload(
-                target
-            )
-        else:
-            transport_kind, relay = self._comm.router.relay_for(target)
-        data_ref, op = await self._comm.write_payload(
+        transport_kind, relay = self._comm.router.relay_for_payload(
+            target, projected_payload
+        )
+        await self._comm.send_payload(
             relay=relay,
+            control_plane=self.control_plane,
             request_id=request_id,
             payload=projected_payload,
             transport=transport_kind,
             from_stage=self.name,
             to_stage=target,
-        )
-        msg = DataReadyMessage(
-            request_id=request_id,
-            from_stage=self.name,
-            to_stage=target,
-            data_ref=data_ref.to_dict(),
+            target_endpoint=endpoint,
         )
         _emit_event(
             request_id=request_id,
@@ -931,8 +997,6 @@ class Stage:
             event_name="stage_hop_sent",
             metadata={"to_stage": target, "transport": transport_kind.value},
         )
-        await self.control_plane.send_to_stage(target, endpoint, msg)
-        await op.wait_for_completion()
 
     @staticmethod
     def _is_isolated_projected_payload(

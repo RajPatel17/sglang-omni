@@ -206,19 +206,17 @@ async def read_tensor(
     )
 
 
-async def send_stream_chunk(
+async def write_stream_chunk(
     relay: Relay,
-    control_plane: Any,
     *,
     request_id: str,
     data: torch.Tensor,
     target_stage: str,
-    target_endpoint: str,
     from_stage: str,
     chunk_id: int,
     metadata: dict | None = None,
     transport: TransportKind,
-) -> None:
+) -> tuple[DataRef, list[Any]]:
     object_id = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
     data_ref, op = await write_tensor(
         relay,
@@ -234,19 +232,7 @@ async def send_stream_chunk(
     data_ref = await _with_stream_metadata(
         relay, data_ref, metadata, transport, pending_ops
     )
-    await control_plane.send_to_stage(
-        target_stage,
-        target_endpoint,
-        DataReadyMessage(
-            request_id=request_id,
-            from_stage=from_stage,
-            to_stage=target_stage,
-            data_ref=data_ref.to_dict(),
-            chunk_id=chunk_id,
-        ),
-    )
-    for pending_op in pending_ops:
-        await pending_op.wait_for_completion()
+    return data_ref, pending_ops
 
 
 async def read_stream_chunk(

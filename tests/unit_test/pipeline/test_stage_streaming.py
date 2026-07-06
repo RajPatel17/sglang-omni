@@ -68,6 +68,12 @@ class _DoneOp:
     async def wait_for_completion(self) -> None:
         pass
 
+    def mark_receiver_done(self) -> None:
+        pass
+
+    def mark_receiver_failed(self, exc: BaseException) -> None:
+        raise exc
+
 
 class _AbortOnReadRelay(_FakeRelay):
     def __init__(self, on_wait) -> None:
@@ -88,11 +94,17 @@ class _CallbackOp:
     async def wait_for_completion(self) -> None:
         self._on_wait()
 
+    def mark_receiver_done(self) -> None:
+        pass
+
+    def mark_receiver_failed(self, exc: BaseException) -> None:
+        raise exc
+
 
 # Stream chunks now always move through the transport router's relay (CUDA-IPC on
 # GPU, shm on CPU). These helpers build real relay-backed messages over an
 # in-process ShmRelay so the receive path is exercised end to end, matching what
-# ``stage_io.send_stream_chunk`` / ``write_payload`` produce on the wire.
+# ``write_stream_chunk`` / ``write_payload`` produce on the wire.
 
 
 async def _make_relay_chunk(
@@ -124,8 +136,6 @@ async def _make_relay_chunk(
         TransportKind.SHM,
         pending_ops,
     )
-    for pending_op in pending_ops:
-        asyncio.create_task(pending_op.wait_for_completion())
     return DataReadyMessage(
         request_id=request_id,
         from_stage=from_stage,
@@ -148,7 +158,6 @@ async def _make_relay_payload(
         payload,
         transport=TransportKind.SHM,
     )
-    asyncio.create_task(op.wait_for_completion())
     return DataReadyMessage(
         request_id=payload.request_id,
         from_stage=from_stage,
@@ -166,7 +175,7 @@ def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=_FakeRelay(),
             scheduler=scheduler,
@@ -280,7 +289,7 @@ def test_stage_fails_pre_payload_stream_chunk_by_default() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -321,7 +330,7 @@ def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -367,7 +376,7 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -447,7 +456,7 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=_FakeControlPlane(),
             relay=_FakeRelay(),
             scheduler=SimpleNamespace(outbox=queue.Queue()),
@@ -491,7 +500,7 @@ def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=_FakeRelay(),
             scheduler=scheduler,
@@ -516,23 +525,35 @@ def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
     asyncio.run(_run())
 
 
-def test_send_stream_chunk_uses_relay() -> None:
+def test_write_stream_chunk_uses_relay() -> None:
     async def _run() -> None:
         control_plane = _FakeControlPlane()
         relay = _FakeRelay()
         codes = torch.empty(11, 1, dtype=torch.long)
 
-        await stage_io.send_stream_chunk(
+        data_ref, ops = await stage_io.write_stream_chunk(
             relay,
-            control_plane,
             request_id="req",
             data=codes,
             target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
             from_stage="tts_engine",
             chunk_id=0,
             transport=TransportKind.SHM,
         )
+        await control_plane.send_to_stage(
+            "vocoder",
+            "inproc://vocoder",
+            DataReadyMessage(
+                request_id="req",
+                from_stage="tts_engine",
+                to_stage="vocoder",
+                data_ref=data_ref.to_dict(),
+                chunk_id=0,
+            ),
+        )
+        for op in ops:
+            op.mark_receiver_done()
+            await op.wait_for_completion()
 
         assert len(relay.puts) == 1
         assert relay.puts[0][0] == "req:stream:tts_engine:vocoder:0"
@@ -560,7 +581,7 @@ def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -599,7 +620,7 @@ def test_stage_drains_relay_stream_chunk_for_already_aborted_request() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -637,7 +658,7 @@ def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -672,7 +693,7 @@ def test_stage_routes_relay_stream_chunk_to_scheduler() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,
@@ -715,7 +736,7 @@ def test_stage_drops_payload_after_abort_during_relay_read() -> None:
             role="single",
             get_next=lambda request_id, output: None,
             gpu_id=None,
-            endpoints={},
+            endpoints={"tts_engine": "inproc://tts_engine"},
             control_plane=control_plane,
             relay=relay,
             scheduler=scheduler,

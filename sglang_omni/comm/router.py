@@ -68,13 +68,16 @@ class CommRouter:
                 "relay-backed stream chunks must be torch.Tensor, got "
                 f"{type(data).__name__}"
             )
-        kind = self.outbound(target)
-        if kind is TransportKind.CUDA_IPC and not data.is_cuda:
-            # Transport must follow the actual tensor device, not just placement:
-            # a GPU-placed edge can legitimately carry a host-resident chunk. Fall
-            # back to SHM (the host transport) instead of failing the transfer.
+        if target in self.remote_stage_names:
+            return TransportKind.MOONCAKE
+        if not data.is_cuda:
             return TransportKind.SHM
-        return kind
+        if self.self_is_gpu and target in self.gpu_stage_names:
+            return TransportKind.CUDA_IPC
+        raise ValueError(
+            f"cuda stream chunk cannot be sent from {self.stage_name!r} to "
+            f"non-GPU target {target!r}"
+        )
 
     def inbound(self, from_stage: str) -> TransportKind:
         if from_stage in self.remote_stage_names:
@@ -103,12 +106,28 @@ class CommRouter:
             )
         return kind, self.relay(kind)
 
-    def relay_for_materialized_payload(
-        self, target: str
+    def relay_for_payload(
+        self, target: str, payload: Any
     ) -> tuple[TransportKind, Relay]:
-        """Return the physical relay for a payload that cannot use local objects."""
-        kind = self._physical_outbound(target)
+        kind = self.outbound_payload(target, payload)
+        if kind is TransportKind.LOCAL_OBJECT:
+            raise ValueError("local_object has no relay")
         return kind, self.relay(kind)
+
+    def outbound_payload(self, target: str, payload: Any) -> TransportKind:
+        if target in self.remote_stage_names:
+            return TransportKind.MOONCAKE
+        devices = _tensor_devices(getattr(payload, "data", payload))
+        if not devices or devices == {"cpu"}:
+            return TransportKind.SHM
+        if devices == {"cuda"}:
+            if self.self_is_gpu and target in self.gpu_stage_names:
+                return TransportKind.CUDA_IPC
+            raise ValueError(
+                f"cuda payload cannot be sent from {self.stage_name!r} to "
+                f"non-GPU target {target!r}"
+            )
+        raise ValueError(f"mixed or unsupported tensor devices in payload: {devices}")
 
     def relay_for_stream(
         self, target: str, data: torch.Tensor
@@ -187,3 +206,30 @@ class CommRouter:
         if self.injected_relay is not None:
             return [self.injected_relay]
         return list(self._relays.values())
+
+
+def _tensor_devices(obj: Any, seen: set[int] | None = None) -> set[str]:
+    if obj is None:
+        return set()
+    seen = set() if seen is None else seen
+    obj_id = id(obj)
+    if obj_id in seen:
+        return set()
+    seen.add(obj_id)
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            return {"cuda"}
+        if obj.device.type == "cpu":
+            return {"cpu"}
+        return {obj.device.type}
+    if isinstance(obj, dict):
+        devices: set[str] = set()
+        for value in obj.values():
+            devices.update(_tensor_devices(value, seen))
+        return devices
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        devices = set()
+        for value in obj:
+            devices.update(_tensor_devices(value, seen))
+        return devices
+    return set()
