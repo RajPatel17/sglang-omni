@@ -1696,9 +1696,11 @@ class OmniScheduler:
             return
         keep = [i for i, was_finished in enumerate(pre_finished) if not was_finished]
         if len(keep) < len(batch.reqs):
-            # Free the decode slot the overrun step allocated for each dropped
-            # row; the request's own KV free does not cover it (see
-            # _free_overrun_step_slots for the cache-config gate).
+            # note (yichi): bugfix — free the decode slot the overrun step
+            # allocated for each dropped row: the request's own KV was already
+            # freed when it finished, and nothing else covers this extra
+            # per-step slot — leaking it drifts allocator state and breaks
+            # bit-reproducibility vs the sync loop.
             self._free_overrun_step_slots(
                 pending_step.forward_batch.out_cache_loc,
                 [i for i, was in enumerate(pre_finished) if was],
@@ -1774,8 +1776,6 @@ class OmniScheduler:
         if not any(drop):
             return batch
         keep = [i for i, d in enumerate(drop) if not d]
-        # filter_batch nulls out_cache_loc; free the dropped rows' step slots
-        # first (their requests' own KV was already freed by the drain).
         self._free_overrun_step_slots(
             batch.out_cache_loc, [i for i, d in enumerate(drop) if d]
         )
