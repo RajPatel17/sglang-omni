@@ -3,10 +3,8 @@
  *
  * Captures mic → 16 kHz mono PCM16 via AudioWorklet → base64-encodes →
  * sends `input_audio_buffer.append`. Server VAD is always on; auto-commit
- * fires on speech_stopped. Each turn renders an editorial card with two
- * paragraphs: the assistant's reply (streamed from response.text.delta)
- * appears first, then the verbatim transcript of what you said (streamed
- * from conversation.item.input_audio_transcription.delta) fills in below.
+ * fires on speech_stopped. The assistant's 24 kHz PCM16 audio is queued for
+ * gapless playback while its text and the user's transcript render below.
  *
  * Vanilla — no framework, no build step, no error handling. Per house
  * style: if something fails, the browser console gets the exception.
@@ -43,6 +41,8 @@
   let workletNode = null;
   let analyserNode = null;
   let drawRaf = 0;
+  let playbackCtx = null;
+  let nextPlaybackTime = 0;
   let turnCounter = 0;
   // Each turn card is keyed by the audio item_id minted at speech_started /
   // committed.
@@ -53,6 +53,7 @@
   const pendingAudioForResponse = [];    // queue of item_ids awaiting response
   let respondingTurnItemId = null;       // item_id of the response currently streaming
   const TARGET_SR = 16000;
+  const OUTPUT_SR = 24000;
 
   // ─────────────────────  Status helpers  ─────────────────────
 
@@ -88,8 +89,9 @@
     wsSend({
       type: "session.update",
       session: {
-        modalities: ["text"],
+        modalities: ["text", "audio"],
         input_audio_format: "pcm16",
+        output_audio_format: "pcm16",
         instructions: instructionsEl.value,
       },
     });
@@ -97,6 +99,7 @@
 
   connectBtn.addEventListener("click", () => {
     const url = wsUrlEl.value.trim();
+    ensurePlaybackContext();
     ws = new WebSocket(url);
     setStatus("Opening line…");
 
@@ -122,6 +125,7 @@
       micStopBtn.disabled = true;
       clearBufferBtn.disabled = true;
       stopMic();
+      stopPlayback();
       ws = null;
     };
 
@@ -262,6 +266,58 @@
     return btoa(binary);
   }
 
+  function base64ToBytes(encoded) {
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function ensurePlaybackContext() {
+    if (!playbackCtx || playbackCtx.state === "closed") {
+      playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+      nextPlaybackTime = 0;
+    }
+    if (playbackCtx.state === "suspended") {
+      playbackCtx.resume();
+    }
+    return playbackCtx;
+  }
+
+  function queueAudioDelta(encoded) {
+    const bytes = base64ToBytes(encoded);
+    if (bytes.byteLength % 2 !== 0) {
+      throw new Error("Received an odd-length PCM16 audio delta");
+    }
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const samples = new Float32Array(bytes.byteLength / 2);
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = view.getInt16(i * 2, true) / 0x8000;
+    }
+
+    const ctx = ensurePlaybackContext();
+    const buffer = ctx.createBuffer(1, samples.length, OUTPUT_SR);
+    buffer.copyToChannel(samples, 0);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+
+    const startAt = Math.max(ctx.currentTime + 0.02, nextPlaybackTime);
+    source.start(startAt);
+    nextPlaybackTime = startAt + buffer.duration;
+  }
+
+  function stopPlayback() {
+    if (playbackCtx) {
+      playbackCtx.close();
+      playbackCtx = null;
+    }
+    nextPlaybackTime = 0;
+  }
+
   // ─────────────────────  Oscilloscope  ─────────────────────
 
   function clearScope() {
@@ -350,11 +406,26 @@
 
       case "response.text.done":
         if (respondingTurnItemId) {
-          setTurnMeta(respondingTurnItemId, "reply done · transcribing");
+          setTurnMeta(respondingTurnItemId, "reply streaming");
+        }
+        return;
+
+      case "response.audio.delta":
+        if (evt.delta) {
+          queueAudioDelta(evt.delta);
+        }
+        return;
+
+      case "response.audio.done":
+        if (respondingTurnItemId) {
+          setTurnMeta(respondingTurnItemId, "reply streaming");
         }
         return;
 
       case "response.done":
+        if (respondingTurnItemId) {
+          setTurnMeta(respondingTurnItemId, "reply done · transcribing");
+        }
         respondingTurnItemId = null;
         return;
 
