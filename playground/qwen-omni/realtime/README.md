@@ -3,19 +3,21 @@
 ![preview](preview.png)
 
 Editorial-broadsheet single-page client for `/v1/realtime`. Captures
-the microphone, streams PCM16 chunks to the WebSocket, and renders each
-turn as an editorial card: the assistant's reply (drop caps, vermilion
-in-progress rule) appears first, then the verbatim transcript of what
-you said fills in below. Vanilla HTML/CSS/JS — no build step.
+the microphone, streams PCM16 chunks to the WebSocket, plays the
+assistant's streamed PCM16 response, and renders each turn as an editorial
+card. The assistant's reply appears first, then the verbatim transcript of
+what you said fills in below. Vanilla HTML/CSS/JS — no build step.
 
 ## Run
 
 1. **Start the server** (with the realtime endpoint enabled):
 
    ```bash
-   sgl-omni serve \
+   python examples/run_omni.py qwen3-speech-server \
      --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
-     --text-only \
+     --gpu-thinker 0 \
+     --gpu-talker 1 \
+     --gpu-code2wav 1 \
      --port 8765 \
      --enable-realtime
    ```
@@ -39,7 +41,7 @@ you said fills in below. Vanilla HTML/CSS/JS — no build step.
 |---|---|
 | **Endpoint** | WebSocket endpoint to connect to. |
 | **Instructions** | System prompt sent in `session.update`. Affects the assistant reply only — transcription always runs verbatim. |
-| **Transcripts** | Each VAD-driven turn appears as a card. The assistant reply streams in first (from `response.text.delta`), then the user transcript fills in below (from `conversation.item.input_audio_transcription.delta`). |
+| **Transcripts** | Each VAD-driven turn appears as a card. The assistant reply streams in first (from `response.text.delta`) while `response.audio.delta` is played, then the user transcript fills in below (from `conversation.item.input_audio_transcription.delta`). |
 
 ## Notes
 
@@ -49,6 +51,8 @@ you said fills in below. Vanilla HTML/CSS/JS — no build step.
   step / package.json required.
 - Audio is captured at 16 kHz, converted to PCM16 little-endian, and
   base64-encoded into `input_audio_buffer.append` frames.
+- The session requests text plus audio output. Audio deltas are mono 24 kHz
+  PCM16 little-endian and are queued with Web Audio for gapless playback.
 - The page does no error handling beyond updating the status line —
   matching the project's house style. If the WS drops mid-session,
   reconnect.

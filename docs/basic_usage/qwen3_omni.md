@@ -274,6 +274,48 @@ runtime_overrides:
       max_running_requests: 16
 ```
 
+### Realtime Speech with Server VAD
+
+The speech pipeline can stream spoken responses over `/v1/realtime`. Enable the
+WebSocket endpoint on the speech-server preset:
+
+```bash
+python examples/run_omni.py qwen3-speech-server \
+  --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --gpu-thinker 0 \
+  --gpu-talker 1 \
+  --gpu-code2wav 1 \
+  --port 8008 \
+  --enable-realtime
+```
+
+After connecting to `ws://localhost:8008/v1/realtime`, request text and audio
+output:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "modalities": ["text", "audio"],
+    "input_audio_format": "pcm16",
+    "output_audio_format": "pcm16"
+  }
+}
+```
+
+Stream mono 16 kHz PCM16 input with `input_audio_buffer.append`. Server VAD
+automatically commits each utterance and starts generation. Text arrives in
+`response.text.delta` events; spoken output arrives as base64-encoded mono
+24 kHz PCM16 in `response.audio.delta` events, followed by
+`response.audio.done` and `response.done`.
+
+Audio output is opt-in: sessions remain text-only unless both modalities are
+requested. A thinker-only server rejects audio negotiation because it has no
+`code2wav` stage.
+
+The browser example in `playground/qwen-omni/realtime` captures microphone
+input and queues the streamed PCM16 response for playback.
+
 ## Single-GPU FP8 on H100/H20
 
 SGLang-Omni can also serve native FP8 Qwen3-Omni checkpoints. Native FP8 uses
