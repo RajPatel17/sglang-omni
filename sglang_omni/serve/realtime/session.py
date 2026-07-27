@@ -153,9 +153,13 @@ class RealtimeSession:
             ["text", "audio"],
         ), "modalities must be ['text'] or ['text', 'audio']"
         audio_requested = candidate.modalities == ["text", "audio"]
-        assert (
-            not audio_requested or self.supports_audio_output
-        ), "audio output is unavailable for this pipeline"
+        if audio_requested and not self.supports_audio_output:
+            await self.send_error(
+                "invalid_request_error",
+                "unsupported_modality",
+                "Audio output is unavailable for this pipeline.",
+            )
+            return
         assert (
             candidate.input_audio_format == "pcm16"
         ), "input_audio_format must be 'pcm16'"

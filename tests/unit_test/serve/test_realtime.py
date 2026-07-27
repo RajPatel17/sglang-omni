@@ -205,13 +205,15 @@ async def test_audio_negotiation_rejects_thinker_only_pipeline_without_mutation(
         }
     )
 
-    with pytest.raises(
-        AssertionError, match="audio output is unavailable for this pipeline"
-    ):
-        await session.handle_session_update(event)
+    await session.handle_session_update(event)
 
     assert session.session_object.modalities == ["text"]
-    assert websocket.events == []
+    assert websocket.events[-1]["type"] == "error"
+    assert websocket.events[-1]["error"] == {
+        "type": "invalid_request_error",
+        "code": "unsupported_modality",
+        "message": "Audio output is unavailable for this pipeline.",
+    }
 
 
 @pytest.mark.asyncio
