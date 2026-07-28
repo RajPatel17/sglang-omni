@@ -163,9 +163,16 @@ class RealtimeSession:
         assert (
             candidate.input_audio_format == "pcm16"
         ), "input_audio_format must be 'pcm16'"
-        assert (
-            candidate.output_audio_format == "pcm16"
-        ), "output_audio_format must be 'pcm16'"
+        if (
+            "output_audio_format" in update
+            and candidate.output_audio_format != "pcm16"
+        ):
+            await self.send_error(
+                "invalid_request_error",
+                "unsupported_audio_format",
+                "Only PCM16 output audio is supported.",
+            )
+            return
         self.session_object = candidate
         await self.send(
             make_event(
@@ -239,9 +246,9 @@ class RealtimeSession:
             return
         task = self.active_task
         request_id = self.active_request_id
-        task.cancel()
         if request_id is not None:
             await self.client.abort(request_id)
+        task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
     async def drain_queue(self) -> None:
@@ -420,6 +427,16 @@ class RealtimeSession:
             return response_text
         except asyncio.CancelledError:
             if not response_done:
+                if wants_audio and not audio_done:
+                    await self.send(
+                        make_event(
+                            "response.audio.done",
+                            response_id=response_id,
+                            item_id=resp_item_id,
+                            output_index=0,
+                            content_index=1,
+                        )
+                    )
                 await self._send_response_done(
                     response_id=response_id,
                     item_id=resp_item_id,
@@ -433,6 +450,16 @@ class RealtimeSession:
         except Exception:
             response_text = "".join(text_acc)
             if not response_done:
+                if wants_audio and saw_audio and not audio_done:
+                    await self.send(
+                        make_event(
+                            "response.audio.done",
+                            response_id=response_id,
+                            item_id=resp_item_id,
+                            output_index=0,
+                            content_index=1,
+                        )
+                    )
                 await self.send_error(
                     "server_error",
                     "response_generation_failed",
@@ -442,7 +469,7 @@ class RealtimeSession:
                     response_id=response_id,
                     item_id=resp_item_id,
                     response_text=response_text,
-                    include_audio=wants_audio,
+                    include_audio=wants_audio and saw_audio,
                     status="failed",
                     reason="error",
                     usage=usage,

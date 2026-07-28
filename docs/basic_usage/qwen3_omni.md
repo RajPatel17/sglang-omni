@@ -157,7 +157,8 @@ print(result["choices"][0]["message"]["content"])
 
 ## Speech Mode
 
-Speech mode runs the full 9-stage pipeline across multiple GPUs. It produces both text (from the thinker) and audio (from the talker) output.
+Speech mode runs the full eight-stage pipeline on one or more GPUs. It produces
+both text (from the thinker) and audio (from the talker) output.
 
 ### Launch the Server
 
@@ -277,14 +278,11 @@ runtime_overrides:
 ### Realtime Speech with Server VAD
 
 The speech pipeline can stream spoken responses over `/v1/realtime`. Enable the
-WebSocket endpoint on the speech-server preset:
+WebSocket endpoint on the standard speech pipeline:
 
 ```bash
-python examples/run_omni.py qwen3-speech-server \
+sgl-omni serve \
   --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --gpu-thinker 0 \
-  --gpu-talker 1 \
-  --gpu-code2wav 1 \
   --port 8008 \
   --enable-realtime
 ```
@@ -314,7 +312,8 @@ requested. A thinker-only server rejects audio negotiation because it has no
 `code2wav` stage.
 
 The browser example in `playground/qwen-omni/realtime` captures microphone
-input and queues the streamed PCM16 response for playback.
+input and lets the user select text-only output or text plus streamed PCM16
+audio playback.
 
 ## Single-GPU FP8 on H100/H20
 

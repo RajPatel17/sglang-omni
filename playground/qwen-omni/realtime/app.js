@@ -3,8 +3,9 @@
  *
  * Captures mic → 16 kHz mono PCM16 via AudioWorklet → base64-encodes →
  * sends `input_audio_buffer.append`. Server VAD is always on; auto-commit
- * fires on speech_stopped. The assistant's 24 kHz PCM16 audio is queued for
- * gapless playback while its text and the user's transcript render below.
+ * fires on speech_stopped. Text-only mode renders the assistant reply and
+ * user transcript. Text + audio mode renders the assistant reply and queues
+ * its 24 kHz PCM16 audio for gapless playback.
  *
  * Vanilla — no framework, no build step, no error handling. Per house
  * style: if something fails, the browser console gets the exception.
@@ -17,6 +18,7 @@
 
   // ─────────────────────  DOM refs  ─────────────────────
   const wsUrlEl       = $("ws-url");
+  const outputModeEl  = $("output-mode");
   const instructionsEl = $("instructions");
   const connectBtn    = $("connect");
   const disconnectBtn = $("disconnect");
@@ -33,6 +35,10 @@
   const oscilloCtx    = oscilloCanvas.getContext("2d");
 
   const transcriptsEl = $("transcripts");
+  const mastheadModeEl = $("masthead-mode");
+  const mastheadTaglineEl = $("masthead-tagline");
+  const transcriptsLabelEl = $("transcripts-label");
+  const transcriptsTaglineEl = $("transcripts-tagline");
 
   // ─────────────────────  State  ─────────────────────
   let ws = null;
@@ -43,6 +49,8 @@
   let drawRaf = 0;
   let playbackCtx = null;
   let nextPlaybackTime = 0;
+  let activeModalities = null;
+  let sessionReady = false;
   let turnCounter = 0;
   // Each turn card is keyed by the audio item_id minted at speech_started /
   // committed.
@@ -83,33 +91,57 @@
     ws.send(JSON.stringify(payload));
   }
 
-  function sendSessionUpdate() {
+  function wantsAudioOutput() {
+    return outputModeEl.value === "text-audio";
+  }
+
+  function connectionWantsAudio() {
+    return activeModalities
+      ? activeModalities.includes("audio")
+      : wantsAudioOutput();
+  }
+
+  function selectedModalities() {
+    return wantsAudioOutput() ? ["text", "audio"] : ["text"];
+  }
+
+  function sendSessionUpdate(modalities = activeModalities || selectedModalities()) {
     // turn_detection is fixed server-side (always server_vad with defaults);
-    // only instructions and audio format need to be sent.
+    // output modalities follow the mode selected before opening the wire.
+    const wantsAudio = modalities.includes("audio");
+    const session = {
+      modalities,
+      input_audio_format: "pcm16",
+      instructions: instructionsEl.value,
+    };
+    if (wantsAudio) {
+      session.output_audio_format = "pcm16";
+    }
     wsSend({
       type: "session.update",
-      session: {
-        modalities: ["text", "audio"],
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        instructions: instructionsEl.value,
-      },
+      session,
     });
   }
 
   connectBtn.addEventListener("click", () => {
     const url = wsUrlEl.value.trim();
-    ensurePlaybackContext();
+    activeModalities = selectedModalities();
+    sessionReady = false;
+    stopPlayback();
+    if (connectionWantsAudio()) {
+      ensurePlaybackContext();
+    }
+    outputModeEl.disabled = true;
     ws = new WebSocket(url);
     setStatus("Opening line…");
 
     ws.onopen = () => {
-      setStatus("Wire open", "connected");
+      setStatus("Negotiating output mode…");
       setLive(true);
       connectBtn.disabled = true;
       disconnectBtn.disabled = false;
-      micStartBtn.disabled = false;
-      sendSessionUpdate();
+      micStartBtn.disabled = true;
+      sendSessionUpdate(activeModalities);
     };
 
     ws.onmessage = (ev) => {
@@ -121,11 +153,14 @@
       setLive(false);
       connectBtn.disabled = false;
       disconnectBtn.disabled = true;
+      outputModeEl.disabled = false;
       micStartBtn.disabled = true;
       micStopBtn.disabled = true;
       clearBufferBtn.disabled = true;
       stopMic();
       stopPlayback();
+      activeModalities = null;
+      sessionReady = false;
       ws = null;
     };
 
@@ -367,10 +402,25 @@
   function handleServerEvent(evt) {
     switch (evt.type) {
       case "session.created":
+        setStatus("Negotiating output mode…");
+        return;
+
       case "session.updated":
-        if (evt.session && evt.session.id) {
-          setStatus(`session ${evt.session.id.slice(0, 12)}…`, "connected");
+        if (
+          !evt.session ||
+          JSON.stringify(evt.session.modalities) !== JSON.stringify(activeModalities)
+        ) {
+          setStatus("Output mode negotiation failed", "error");
+          if (ws) ws.close();
+          return;
         }
+        sessionReady = true;
+        micStartBtn.disabled = false;
+        setStatus(
+          `${connectionWantsAudio() ? "Text + audio" : "Text only"} · ` +
+            `session ${evt.session.id.slice(0, 12)}…`,
+          "connected",
+        );
         return;
 
       case "input_audio_buffer.speech_started":
@@ -406,12 +456,17 @@
 
       case "response.text.done":
         if (respondingTurnItemId) {
-          setTurnMeta(respondingTurnItemId, "reply streaming");
+          setTurnMeta(
+            respondingTurnItemId,
+            connectionWantsAudio()
+              ? "reply streaming"
+              : "reply done · transcribing",
+          );
         }
         return;
 
       case "response.audio.delta":
-        if (evt.delta) {
+        if (connectionWantsAudio() && evt.delta) {
           queueAudioDelta(evt.delta);
         }
         return;
@@ -423,18 +478,23 @@
         return;
 
       case "response.done":
-        if (respondingTurnItemId) {
-          setTurnMeta(respondingTurnItemId, "reply done · transcribing");
+        if (connectionWantsAudio() && respondingTurnItemId) {
+          const node = turnCards.get(respondingTurnItemId);
+          if (node) node.dataset.state = "completed";
+          setTurnMeta(respondingTurnItemId, "complete");
         }
         respondingTurnItemId = null;
         return;
 
-      // ── Pass 2: transcription of what the user said (streams after) ──
+      // Text-only mode preserves the original transcript-oriented experience.
       case "conversation.item.input_audio_transcription.delta":
-        appendToBody(evt.item_id, "user-body", evt.delta || "");
+        if (!connectionWantsAudio()) {
+          appendToBody(evt.item_id, "user-body", evt.delta || "");
+        }
         return;
 
       case "conversation.item.input_audio_transcription.completed": {
+        if (connectionWantsAudio()) return;
         const node = ensureTurn(evt.item_id);
         node.dataset.state = "completed";
         const body = node.querySelector(".user-body");
@@ -474,6 +534,10 @@
     node = document.createElement("article");
     node.className = "utterance";
     node.dataset.state = "in-progress";
+    const transcriptBody = connectionWantsAudio()
+      ? ""
+      : `<p class="utterance-role">You said</p>` +
+        `<p class="utterance-body user-body"></p>`;
     node.innerHTML =
       `<div class="utterance-meta">` +
       `<span class="serial">${serial}</span>` +
@@ -482,8 +546,7 @@
       `</div>` +
       `<p class="utterance-role">Assistant</p>` +
       `<p class="utterance-body assistant-body"></p>` +
-      `<p class="utterance-role">You said</p>` +
-      `<p class="utterance-body user-body"></p>`;
+      transcriptBody;
     transcriptsEl.appendChild(node);
     transcriptsEl.scrollTop = transcriptsEl.scrollHeight;
     turnCards.set(itemId, node);
@@ -511,5 +574,35 @@
 
   // ─────────────────────  Misc UI  ─────────────────────
 
+  function updatePresentation() {
+    if (wantsAudioOutput()) {
+      mastheadModeEl.textContent = "LIVE AUDIO RESPONSES";
+      mastheadTaglineEl.innerHTML =
+        "A demonstration of <code>/v1/realtime</code> — voice in, streamed " +
+        "text and voice out. Server VAD detects when you stop; the engine " +
+        "streams its spoken answer.";
+      transcriptsLabelEl.textContent = "Assistant Responses";
+      transcriptsTaglineEl.innerHTML =
+        "Each response is set in <em>Newsreader Italic</em>, lifted from " +
+        "the wire as the engine emits it.";
+    } else {
+      mastheadModeEl.textContent = "A LIVE TRANSCRIPT";
+      mastheadTaglineEl.innerHTML =
+        "A demonstration of <code>/v1/realtime</code> — voice in, text out. " +
+        "Server VAD detects when you stop; the engine answers, then " +
+        "transcribes what you said.";
+      transcriptsLabelEl.textContent = "The Transcript";
+      transcriptsTaglineEl.innerHTML =
+        "Each turn shows the assistant reply followed by the verbatim " +
+        "transcript of what you said.";
+    }
+    clearTurns();
+  }
+
+  outputModeEl.addEventListener("change", () => {
+    stopPlayback();
+    updatePresentation();
+  });
   instructionsEl.addEventListener("change", () => sendSessionUpdate());
+  updatePresentation();
 })();

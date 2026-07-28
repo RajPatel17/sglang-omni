@@ -1,23 +1,17 @@
 # Wire Service — /v1/realtime web demo
 
-![preview](preview.png)
-
 Editorial-broadsheet single-page client for `/v1/realtime`. Captures
-the microphone, streams PCM16 chunks to the WebSocket, plays the
-assistant's streamed PCM16 response, and renders each turn as an editorial
-card. The assistant's reply appears first, then the verbatim transcript of
-what you said fills in below. Vanilla HTML/CSS/JS — no build step.
+the microphone and streams PCM16 chunks to the WebSocket. The user can select
+text-only output or text plus streamed PCM16 audio. Vanilla HTML/CSS/JS — no
+build step.
 
 ## Run
 
 1. **Start the server** (with the realtime endpoint enabled):
 
    ```bash
-   python examples/run_omni.py qwen3-speech-server \
+   sgl-omni serve \
      --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
-     --gpu-thinker 0 \
-     --gpu-talker 1 \
-     --gpu-code2wav 1 \
      --port 8765 \
      --enable-realtime
    ```
@@ -31,17 +25,18 @@ what you said fills in below. Vanilla HTML/CSS/JS — no build step.
    ```
 
 3. **Open** <http://127.0.0.1:8080> in a modern browser. Click
-   **Open Wire**, then **Begin Transmission**, and start speaking.
-   Server VAD detects when you stop; the engine replies, then
-   transcribes your speech to fill conversation history.
+   Choose an output mode, click **Open Wire**, then **Begin Transmission**,
+   and start speaking. The output mode is locked for the duration of the
+   connection.
 
 ## What you'll see
 
 | UI panel | Meaning |
 |---|---|
 | **Endpoint** | WebSocket endpoint to connect to. |
+| **Output** | **Text only** requests `["text"]` and displays the assistant reply followed by the user's verbatim transcript. **Text + audio** requests `["text", "audio"]`, plays the streamed spoken response, and displays only the assistant reply. |
 | **Instructions** | System prompt sent in `session.update`. Affects the assistant reply only — transcription always runs verbatim. |
-| **Transcripts** | Each VAD-driven turn appears as a card. The assistant reply streams in first (from `response.text.delta`) while `response.audio.delta` is played, then the user transcript fills in below (from `conversation.item.input_audio_transcription.delta`). |
+| **Responses** | Each VAD-driven turn appears as a card. Assistant text is rendered from `response.text.delta`; text-only mode also renders `conversation.item.input_audio_transcription.delta`. |
 
 ## Notes
 
@@ -51,7 +46,9 @@ what you said fills in below. Vanilla HTML/CSS/JS — no build step.
   step / package.json required.
 - Audio is captured at 16 kHz, converted to PCM16 little-endian, and
   base64-encoded into `input_audio_buffer.append` frames.
-- The session requests text plus audio output. Audio deltas are mono 24 kHz
+- Text-only mode preserves the original playground behavior and requests only
+  the `text` modality.
+- Text + audio mode requests both modalities. Audio deltas are mono 24 kHz
   PCM16 little-endian and are queued with Web Audio for gapless playback.
 - The page does no error handling beyond updating the status line —
   matching the project's house style. If the WS drops mid-session,

@@ -246,11 +246,16 @@ async def test_unsupported_output_format_does_not_mutate_session() -> None:
         }
     )
 
-    with pytest.raises(AssertionError, match="output_audio_format must be 'pcm16'"):
-        await session.handle_session_update(event)
+    await session.handle_session_update(event)
 
     assert session.session_object.output_audio_format == "pcm16"
-    assert websocket.events == []
+    assert session.session_object.modalities == ["text"]
+    assert websocket.events[-1]["type"] == "error"
+    assert websocket.events[-1]["error"] == {
+        "type": "invalid_request_error",
+        "code": "unsupported_audio_format",
+        "message": "Only PCM16 output audio is supported.",
+    }
 
 
 @pytest.mark.asyncio
@@ -320,3 +325,48 @@ async def test_cancellation_emits_cancelled_response_done() -> None:
     assert len(client.aborted) == 1
     assert websocket.events[-1]["type"] == "response.done"
     assert websocket.events[-1]["response"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_audio_cancellation_emits_audio_done_before_response_done() -> None:
+    session, websocket, client = _session([])
+    session.session_object.modalities = ["text", "audio"]
+    lifecycle: list[str] = []
+
+    async def blocked_stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        del args, kwargs
+        try:
+            await asyncio.Future()
+        finally:
+            lifecycle.append("cancelled")
+        yield
+
+    original_abort = client.abort
+
+    async def recording_abort(request_id: str) -> None:
+        lifecycle.append("abort")
+        await original_abort(request_id)
+
+    session.client.completion_stream = blocked_stream  # type: ignore[method-assign]
+    session.client.abort = recording_abort  # type: ignore[method-assign]
+    task = asyncio.create_task(session.run_response("data:audio/wav;base64,AAAA"))
+    session.active_task = task
+    await asyncio.sleep(0)
+
+    await session.handle_response_cancel(
+        ResponseCancel.model_validate({"type": "response.cancel"})
+    )
+
+    assert task.cancelled()
+    assert lifecycle == ["abort", "cancelled"]
+    assert _event_types(websocket) == [
+        "response.created",
+        "response.audio.done",
+        "response.done",
+    ]
+    response = websocket.events[-1]["response"]
+    assert response["status"] == "cancelled"
+    assert {content["type"] for content in response["output"][0]["content"]} == {
+        "text",
+        "audio",
+    }
