@@ -7,11 +7,38 @@ build step.
 
 ## Run
 
-1. **Start the server** (with the realtime endpoint enabled):
+1. **Start the server** with one of these configurations:
+
+   Text output only (one GPU; matches the playground default):
 
    ```bash
    sgl-omni serve \
      --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+     --text-only \
+     --port 8765 \
+     --enable-realtime
+   ```
+
+   Text and audio output on one H200:
+
+   ```bash
+   sgl-omni serve \
+     --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+     --config examples/configs/qwen3_omni_colocated_h200.yaml \
+     --colocate \
+     --port 8765 \
+     --enable-realtime
+   ```
+
+   Text and audio output on two GPUs:
+
+   ```bash
+   python examples/run_omni.py qwen3-speech-server \
+     --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+     --gpu-thinker 0 \
+     --gpu-talker 1 \
+     --gpu-code-predictor 1 \
+     --gpu-code2wav 1 \
      --port 8765 \
      --enable-realtime
    ```
@@ -27,7 +54,7 @@ build step.
 3. **Open** <http://127.0.0.1:8080> in a modern browser. Choose an output mode,
    click **Open Wire**, then **Begin Transmission**,
    and start speaking. The output mode is locked for the duration of the
-   connection.
+   connection. **Text + audio** requires one of the speech-server configurations.
 
 ## What you'll see
 
