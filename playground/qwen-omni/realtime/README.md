@@ -24,8 +24,8 @@ build step.
    python -m http.server 8080
    ```
 
-3. **Open** <http://127.0.0.1:8080> in a modern browser. Click
-   Choose an output mode, click **Open Wire**, then **Begin Transmission**,
+3. **Open** <http://127.0.0.1:8080> in a modern browser. Choose an output mode,
+   click **Open Wire**, then **Begin Transmission**,
    and start speaking. The output mode is locked for the duration of the
    connection.
 
