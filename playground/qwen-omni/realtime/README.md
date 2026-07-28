@@ -34,7 +34,7 @@ build step.
 | UI panel | Meaning |
 |---|---|
 | **Endpoint** | WebSocket endpoint to connect to. |
-| **Output** | **Text only** requests `["text"]` and displays the assistant reply followed by the user's verbatim transcript. **Text + audio** requests `["text", "audio"]`, plays the streamed spoken response, and displays only the assistant reply. |
+| **Output** | Defaults to **Text only**, which requests `["text"]` and displays the assistant reply followed by the user's verbatim transcript. **Text + audio** requests `["text", "audio"]`, plays the streamed spoken response, and displays only the assistant reply. |
 | **Instructions** | System prompt sent in `session.update`. Affects the assistant reply only — transcription always runs verbatim. |
 | **Responses** | Each VAD-driven turn appears as a card. Assistant text is rendered from `response.text.delta`; text-only mode also renders `conversation.item.input_audio_transcription.delta`. |
 
