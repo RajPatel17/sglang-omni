@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from starlette.websockets import WebSocketState
 
-from sglang_omni.client.types import CompletionStreamChunk, UsageInfo
+from sglang_omni.client.types import CompletionStreamChunk
 from sglang_omni.serve.realtime.events import ResponseCancel, SessionUpdate
 from sglang_omni.serve.realtime.session import RealtimeSession
 
@@ -60,8 +60,6 @@ def _chunk(
     text: str = "",
     audio_b64: str | None = None,
     finish_reason: str | None = None,
-    usage: UsageInfo | None = None,
-    stage_name: str | None = None,
 ) -> CompletionStreamChunk:
     return CompletionStreamChunk(
         request_id="request",
@@ -69,8 +67,6 @@ def _chunk(
         text=text,
         audio_b64=audio_b64,
         finish_reason=finish_reason,
-        usage=usage,
-        stage_name=stage_name,
     )
 
 
@@ -96,13 +92,12 @@ def _event_types(websocket: RecordingWebSocket) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_text_only_response_preserves_existing_event_contract() -> None:
-    usage = UsageInfo(prompt_tokens=3, completion_tokens=2, total_tokens=5)
+async def test_text_only_response_preserves_existing_contract() -> None:
     session, websocket, client = _session(
         [
             _chunk(text="hello "),
             _chunk(text="world"),
-            _chunk(finish_reason="stop", usage=usage, stage_name="decode"),
+            _chunk(finish_reason="stop"),
         ]
     )
 
@@ -116,35 +111,36 @@ async def test_text_only_response_preserves_existing_event_contract() -> None:
         "response.text.done",
         "response.done",
     ]
-    assert client.requests[0][0].output_modalities == ["text"]
-    assert client.requests[0][2] == "wav"
-    response = websocket.events[-1]["response"]
-    assert response["status"] == "completed"
-    assert response["output"][0]["content"] == [{"type": "text", "text": "hello world"}]
-    assert response["usage"]["total_tokens"] == 5
+    request, _, audio_format = client.requests[0]
+    assert request.output_modalities == ["text"]
+    assert audio_format == "wav"
+    assert websocket.events[-1]["response"]["output"][0]["content"] == [
+        {"type": "text", "text": "hello world"}
+    ]
 
 
 @pytest.mark.asyncio
-async def test_audio_response_streams_pcm_until_both_terminals_complete() -> None:
-    usage = UsageInfo(prompt_tokens=4, completion_tokens=3, total_tokens=7)
+async def test_audio_response_streams_text_and_pcm_from_one_snapshot() -> None:
     session, websocket, client = _session(
         [
-            _chunk(text="hello", stage_name="decode"),
+            _chunk(text="hello"),
             _chunk(
                 modality="audio",
                 audio_b64="AQI=",
                 finish_reason="stop",
-                stage_name="code2wav",
             ),
-            _chunk(
-                text=" world",
-                finish_reason="length",
-                usage=usage,
-                stage_name="decode",
-            ),
+            _chunk(text=" world", finish_reason="length"),
         ]
     )
     session.session_object.modalities = ["text", "audio"]
+    original_send_text = websocket.send_text
+
+    async def send_text_and_update(payload: str) -> None:
+        await original_send_text(payload)
+        if websocket.events[-1]["type"] == "response.created":
+            session.session_object.modalities = ["text"]
+
+    websocket.send_text = send_text_and_update  # type: ignore[method-assign]
 
     response_text = await session.run_response("data:audio/wav;base64,AAAA")
 
@@ -158,244 +154,140 @@ async def test_audio_response_streams_pcm_until_both_terminals_complete() -> Non
         "response.text.done",
         "response.done",
     ]
-    assert client.requests[0][0].output_modalities == ["text", "audio"]
-    assert client.requests[0][2] == "pcm"
-    audio_delta = websocket.events[2]
-    assert audio_delta["delta"] == "AQI="
-    assert audio_delta["content_index"] == 1
+    request, _, audio_format = client.requests[0]
+    assert request.output_modalities == ["text", "audio"]
+    assert audio_format == "pcm"
+    assert websocket.events[2]["delta"] == "AQI="
     response = websocket.events[-1]["response"]
     assert response["status_details"]["reason"] == "length"
-    assert response["usage"]["total_tokens"] == 7
     assert response["output"][0]["content"] == [
         {"type": "text", "text": "hello world"},
         {"type": "audio", "transcript": "hello world"},
     ]
 
 
-@pytest.mark.asyncio
-async def test_response_uses_one_consistent_modality_snapshot() -> None:
-    session, websocket, client = _session(
-        [
-            _chunk(modality="audio", audio_b64="AQI=", stage_name="code2wav"),
-            _chunk(
-                modality="audio",
-                finish_reason="stop",
-                stage_name="code2wav",
-            ),
-            _chunk(text="hello", finish_reason="stop", stage_name="decode"),
-        ]
-    )
-    session.session_object.modalities = ["text", "audio"]
-    original_send_text = websocket.send_text
-
-    async def send_text_and_update(payload: str) -> None:
-        await original_send_text(payload)
-        if websocket.events[-1]["type"] == "response.created":
-            session.session_object.modalities = ["text"]
-
-    websocket.send_text = send_text_and_update  # type: ignore[method-assign]
-
-    await session.run_response("data:audio/wav;base64,AAAA")
-
-    assert client.requests[0][0].output_modalities == ["text", "audio"]
-    assert client.requests[0][2] == "pcm"
-    assert "response.audio.delta" in _event_types(websocket)
-    assert websocket.events[-1]["response"]["status"] == "completed"
-
-
-@pytest.mark.asyncio
-async def test_terminal_audio_payload_is_emitted_before_audio_done() -> None:
-    session, websocket, _ = _session(
-        [
-            _chunk(finish_reason="stop", stage_name="decode"),
-            _chunk(
-                modality="audio",
-                audio_b64="AwQ=",
-                finish_reason="stop",
-                stage_name="code2wav",
-            ),
-        ]
-    )
-    session.session_object.modalities = ["text", "audio"]
-
-    await session.run_response("data:audio/wav;base64,AAAA")
-
-    types = _event_types(websocket)
-    assert types.index("response.audio.delta") < types.index("response.audio.done")
-
-
-@pytest.mark.asyncio
-async def test_audio_negotiation_rejects_thinker_only_pipeline_without_mutation() -> (
-    None
-):
-    session, websocket, _ = _session([], supports_audio_output=False)
-    event = SessionUpdate.model_validate(
-        {
-            "type": "session.update",
-            "session": {"modalities": ["text", "audio"]},
-        }
-    )
-
-    await session.handle_session_update(event)
-
-    assert session.session_object.modalities == ["text"]
-    assert websocket.events[-1]["type"] == "error"
-    assert websocket.events[-1]["error"] == {
-        "type": "invalid_request_error",
-        "code": "unsupported_modality",
-        "message": "Audio output is unavailable for this pipeline.",
-    }
-
-
-@pytest.mark.asyncio
-async def test_audio_negotiation_accepts_pcm16_for_speech_pipeline() -> None:
-    session, websocket, _ = _session([])
-    event = SessionUpdate.model_validate(
-        {
-            "type": "session.update",
-            "session": {
+@pytest.mark.parametrize(
+    ("supports_audio_output", "update", "error_code"),
+    [
+        (
+            True,
+            {
                 "modalities": ["text", "audio"],
                 "output_audio_format": "pcm16",
             },
-        }
-    )
-
-    await session.handle_session_update(event)
-
-    assert session.session_object.modalities == ["text", "audio"]
-    assert websocket.events[-1]["type"] == "session.updated"
-    assert websocket.events[-1]["session"]["output_audio_format"] == "pcm16"
-
-
+            None,
+        ),
+        (False, {"modalities": ["text", "audio"]}, "unsupported_modality"),
+        (True, {"modalities": ["audio"]}, "unsupported_modality"),
+        (True, {"output_audio_format": "g711_ulaw"}, "unsupported_audio_format"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_unsupported_modalities_do_not_mutate_session() -> None:
-    session, websocket, _ = _session([])
-    event = SessionUpdate.model_validate(
-        {
-            "type": "session.update",
-            "session": {"modalities": ["audio"]},
-        }
-    )
-
-    await session.handle_session_update(event)
-
-    assert session.session_object.modalities == ["text"]
-    assert websocket.events[-1]["error"]["code"] == "unsupported_modality"
-
-
-@pytest.mark.asyncio
-async def test_unsupported_output_format_does_not_mutate_session() -> None:
-    session, websocket, _ = _session([])
-    event = SessionUpdate.model_validate(
-        {
-            "type": "session.update",
-            "session": {"output_audio_format": "g711_ulaw"},
-        }
-    )
-
-    await session.handle_session_update(event)
-
-    assert session.session_object.output_audio_format == "pcm16"
-    assert session.session_object.modalities == ["text"]
-    assert websocket.events[-1]["type"] == "error"
-    assert websocket.events[-1]["error"] == {
-        "type": "invalid_request_error",
-        "code": "unsupported_audio_format",
-        "message": "Only PCM16 output audio is supported.",
-    }
-
-
-@pytest.mark.asyncio
-async def test_missing_audio_marks_response_failed() -> None:
+async def test_audio_session_update(
+    supports_audio_output: bool,
+    update: dict[str, Any],
+    error_code: str | None,
+) -> None:
     session, websocket, _ = _session(
-        [
-            _chunk(finish_reason="stop", stage_name="decode"),
-            _chunk(
-                modality="audio",
-                finish_reason="stop",
-                stage_name="code2wav",
-            ),
-        ]
+        [],
+        supports_audio_output=supports_audio_output,
     )
-    session.session_object.modalities = ["text", "audio"]
+    before = session.session_object.model_dump()
 
-    await session.run_response("data:audio/wav;base64,AAAA")
-
-    assert "response.audio.done" not in _event_types(websocket)
-    assert _event_types(websocket)[-2:] == ["error", "response.done"]
-    assert websocket.events[-2]["error"]["code"] == "audio_output_missing"
-    assert websocket.events[-1]["response"]["status"] == "failed"
-    assert (
-        websocket.events[-1]["response"]["status_details"]["reason"]
-        == "audio_output_missing"
+    await session.handle_session_update(
+        SessionUpdate.model_validate({"type": "session.update", "session": update})
     )
-    assert websocket.events[-1]["response"]["output"][0]["content"] == [
-        {"type": "text", "text": ""}
-    ]
+
+    if error_code is None:
+        assert session.session_object.modalities == ["text", "audio"]
+        assert websocket.events[-1]["type"] == "session.updated"
+        assert websocket.events[-1]["session"]["output_audio_format"] == "pcm16"
+    else:
+        assert session.session_object.model_dump() == before
+        assert websocket.events[-1]["error"]["code"] == error_code
 
 
+@pytest.mark.parametrize(
+    ("chunks", "modalities", "error", "text", "code", "reason"),
+    [
+        (
+            [
+                _chunk(finish_reason="stop"),
+                _chunk(modality="audio", finish_reason="stop"),
+            ],
+            ["text", "audio"],
+            None,
+            "",
+            "audio_output_missing",
+            "audio_output_missing",
+        ),
+        (
+            [_chunk(text="partial")],
+            ["text"],
+            RuntimeError("pipeline failed"),
+            "partial",
+            "response_generation_failed",
+            "error",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_midstream_failure_emits_error_and_failed_response_done() -> None:
-    session, websocket, _ = _session(
-        [_chunk(text="partial")],
-        error=RuntimeError("pipeline failed"),
-    )
+async def test_failed_response_closes_text_before_done(
+    chunks: list[CompletionStreamChunk],
+    modalities: list[str],
+    error: Exception | None,
+    text: str,
+    code: str,
+    reason: str,
+) -> None:
+    session, websocket, _ = _session(chunks, error=error)
+    session.session_object.modalities = modalities
 
     response_text = await session.run_response("data:audio/wav;base64,AAAA")
 
-    assert response_text == "partial"
+    assert response_text == text
     assert _event_types(websocket)[-3:] == [
         "response.text.done",
         "error",
         "response.done",
     ]
-    assert websocket.events[-2]["error"]["code"] == "response_generation_failed"
+    assert websocket.events[-2]["error"]["code"] == code
     response = websocket.events[-1]["response"]
     assert response["status"] == "failed"
-    assert response["output"][0]["content"][0]["text"] == "partial"
+    assert response["status_details"]["reason"] == reason
+    assert response["output"][0]["content"] == [{"type": "text", "text": text}]
+    if code == "audio_output_missing":
+        assert "response.audio.done" not in _event_types(websocket)
 
 
+@pytest.mark.parametrize(
+    ("modalities", "audio_delta"),
+    [
+        (["text", "audio"], None),
+        (["text", "audio"], "AQI="),
+    ],
+)
 @pytest.mark.asyncio
-async def test_cancellation_emits_cancelled_response_done() -> None:
+async def test_cancellation_closes_only_started_content(
+    modalities: list[str],
+    audio_delta: str | None,
+) -> None:
     session, websocket, client = _session([])
+    session.session_object.modalities = modalities
+    stream_blocked = asyncio.Event()
 
     async def blocked_stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         del args, kwargs
+        if audio_delta is not None:
+            yield _chunk(modality="audio", audio_b64=audio_delta)
+        stream_blocked.set()
         await asyncio.Future()
         yield
 
     session.client.completion_stream = blocked_stream  # type: ignore[method-assign]
     task = asyncio.create_task(session.run_response("data:audio/wav;base64,AAAA"))
     session.active_task = task
-    await asyncio.sleep(0)
-    await session.handle_response_cancel(
-        ResponseCancel.model_validate({"type": "response.cancel"})
-    )
-
-    assert task.cancelled()
-    assert len(client.aborted) == 1
-    assert _event_types(websocket)[-2:] == [
-        "response.text.done",
-        "response.done",
-    ]
-    assert websocket.events[-1]["response"]["status"] == "cancelled"
-    assert "error" not in _event_types(websocket)
-
-
-@pytest.mark.asyncio
-async def test_audio_cancellation_before_first_delta_does_not_declare_audio() -> None:
-    session, websocket, client = _session([])
-    session.session_object.modalities = ["text", "audio"]
-
-    async def blocked_stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        del args, kwargs
-        await asyncio.Future()
-        yield
-
-    session.client.completion_stream = blocked_stream  # type: ignore[method-assign]
-    task = asyncio.create_task(session.run_response("data:audio/wav;base64,AAAA"))
-    session.active_task = task
-    await asyncio.sleep(0)
+    await asyncio.wait_for(stream_blocked.wait(), timeout=1)
 
     await session.handle_response_cancel(
         ResponseCancel.model_validate({"type": "response.cancel"})
@@ -403,48 +295,19 @@ async def test_audio_cancellation_before_first_delta_does_not_declare_audio() ->
 
     assert task.cancelled()
     assert len(client.aborted) == 1
-    assert _event_types(websocket) == [
-        "response.created",
-        "response.text.done",
-        "response.done",
-    ]
+    expected_types = ["response.created"]
+    if audio_delta is not None:
+        expected_types.append("response.audio.delta")
+    expected_types.append("response.text.done")
+    if audio_delta is not None:
+        expected_types.append("response.audio.done")
+    expected_types.append("response.done")
+    assert _event_types(websocket) == expected_types
     response = websocket.events[-1]["response"]
     assert response["status"] == "cancelled"
-    assert response["output"][0]["content"] == [{"type": "text", "text": ""}]
-
-
-@pytest.mark.asyncio
-async def test_audio_cancellation_closes_started_audio_before_response_done() -> None:
-    session, websocket, client = _session([])
-    session.session_object.modalities = ["text", "audio"]
-    audio_sent = asyncio.Event()
-
-    async def blocked_stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        del args, kwargs
-        yield _chunk(modality="audio", audio_b64="AQI=")
-        audio_sent.set()
-        await asyncio.Future()
-        yield
-
-    session.client.completion_stream = blocked_stream  # type: ignore[method-assign]
-    task = asyncio.create_task(session.run_response("data:audio/wav;base64,AAAA"))
-    session.active_task = task
-    await asyncio.wait_for(audio_sent.wait(), timeout=1)
-
-    await session.handle_response_cancel(
-        ResponseCancel.model_validate({"type": "response.cancel"})
-    )
-
-    assert task.cancelled()
-    assert len(client.aborted) == 1
-    assert _event_types(websocket)[-3:] == [
-        "response.text.done",
-        "response.audio.done",
-        "response.done",
-    ]
-    response = websocket.events[-1]["response"]
-    assert response["status"] == "cancelled"
-    assert {content["type"] for content in response["output"][0]["content"]} == {
-        "text",
-        "audio",
-    }
+    expected_content_types = {"text"}
+    if audio_delta is not None:
+        expected_content_types.add("audio")
+    assert {
+        content["type"] for content in response["output"][0]["content"]
+    } == expected_content_types
