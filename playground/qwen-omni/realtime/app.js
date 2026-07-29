@@ -159,6 +159,8 @@
       clearBufferBtn.disabled = true;
       stopMic();
       stopPlayback();
+      pendingAudioForResponse.length = 0;
+      respondingTurnItemId = null;
       activeModalities = null;
       sessionReady = false;
       ws = null;
