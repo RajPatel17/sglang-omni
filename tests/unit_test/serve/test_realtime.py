@@ -485,6 +485,29 @@ async def test_cancellation_before_request_submission_skips_engine_call() -> Non
 
 
 @pytest.mark.asyncio
+async def test_cancellation_before_run_response_starts_skips_engine_call() -> None:
+    session, websocket, client = _session([])
+    session._response_start_pending = True
+
+    await session.handle_response_cancel(
+        ResponseCancel.model_validate({"type": "response.cancel"})
+    )
+    response_text = await session.run_response("data:audio/wav;base64,AAAA")
+
+    assert response_text == ""
+    assert client.aborted == []
+    assert client.requests == []
+    assert _event_types(websocket) == [
+        "response.created",
+        "response.text.done",
+        "response.done",
+    ]
+    assert websocket.events[-1]["response"]["status"] == "cancelled"
+    assert session._response_start_pending is False
+    assert session._cancel_pending_response is False
+
+
+@pytest.mark.asyncio
 async def test_audio_cancellation_before_first_delta_does_not_declare_audio() -> None:
     session, websocket, client = _session([])
     session.session_object.modalities = ["text", "audio"]

@@ -104,6 +104,8 @@ class RealtimeSession:
         self.active_request_id: str | None = None
         self.active_response_request_id: str | None = None
         self.cancelled_response_request_id: str | None = None
+        self._response_start_pending = False
+        self._cancel_pending_response = False
         self.active_task: asyncio.Task | None = None
         # VAD may emit speech_stopped while engine is still busy on an
         # earlier utterance — serialize via FIFO.
@@ -261,7 +263,11 @@ class RealtimeSession:
     async def handle_response_cancel(self, event: ResponseCancel) -> None:
         del event
         request_id = self.active_response_request_id
-        if request_id is None or self.cancelled_response_request_id == request_id:
+        if request_id is None:
+            if self._response_start_pending:
+                self._cancel_pending_response = True
+            return
+        if self.cancelled_response_request_id == request_id:
             return
         self.cancelled_response_request_id = request_id
         await self.client.abort(request_id)
@@ -269,9 +275,14 @@ class RealtimeSession:
     async def drain_queue(self) -> None:
         while not self.closed:
             item_id, payload = await self.response_queue.get()
-            self.active_task = asyncio.create_task(self.run_turn(item_id, payload))
-            await asyncio.gather(self.active_task, return_exceptions=True)
-            self.active_task = None
+            self._response_start_pending = True
+            try:
+                self.active_task = asyncio.create_task(self.run_turn(item_id, payload))
+                await asyncio.gather(self.active_task, return_exceptions=True)
+            finally:
+                self.active_task = None
+                self._response_start_pending = False
+                self._cancel_pending_response = False
 
     async def run_turn(self, item_id: str, audio_payload: str) -> None:
         """Pass 1: response (user-facing, streams fast).
@@ -296,6 +307,10 @@ class RealtimeSession:
         request_id = f"rt-{self.session_id}-{uuid.uuid4().hex}"
         self.active_request_id = request_id
         self.active_response_request_id = request_id
+        if self._cancel_pending_response:
+            self.cancelled_response_request_id = request_id
+            self._cancel_pending_response = False
+        self._response_start_pending = False
         text_acc: list[str] = []
         finish_reason = "stop"
         usage: dict[str, Any] | None = None
