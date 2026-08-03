@@ -49,6 +49,8 @@
   let drawRaf = 0;
   let playbackCtx = null;
   let nextPlaybackTime = 0;
+  let acceptingResponseAudio = false;
+  const playbackSources = new Set();
   let activeModalities = null;
   let sessionReady = false;
   let turnCounter = 0;
@@ -322,6 +324,7 @@
   }
 
   function queueAudioDelta(encoded) {
+    if (!acceptingResponseAudio) return;
     const bytes = base64ToBytes(encoded);
     if (bytes.byteLength % 2 !== 0) {
       throw new Error("Received an odd-length PCM16 audio delta");
@@ -339,13 +342,29 @@
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
+    playbackSources.add(source);
+    source.onended = () => playbackSources.delete(source);
 
     const startAt = Math.max(ctx.currentTime + 0.02, nextPlaybackTime);
     source.start(startAt);
     nextPlaybackTime = startAt + buffer.duration;
   }
 
+  function interruptPlayback() {
+    acceptingResponseAudio = false;
+    for (const source of playbackSources) {
+      try {
+        source.stop();
+      } catch (_) {
+        // The source may have already ended between iteration and stop().
+      }
+    }
+    playbackSources.clear();
+    nextPlaybackTime = playbackCtx ? playbackCtx.currentTime : 0;
+  }
+
   function stopPlayback() {
+    interruptPlayback();
     if (playbackCtx) {
       playbackCtx.close();
       playbackCtx = null;
@@ -424,6 +443,11 @@
         return;
 
       case "input_audio_buffer.speech_started":
+        if (connectionWantsAudio() && respondingTurnItemId) {
+          wsSend({ type: "response.cancel" });
+          interruptPlayback();
+          setTurnMeta(respondingTurnItemId, "interrupted");
+        }
         ensureTurn(evt.item_id);
         setTurnMeta(evt.item_id, `started ${ms(evt.audio_start_ms)}`);
         return;
@@ -443,6 +467,8 @@
       // ── Pass 1: assistant reply (streams first) ──
       case "response.created":
         respondingTurnItemId = pendingAudioForResponse.shift() || null;
+        acceptingResponseAudio =
+          connectionWantsAudio() && respondingTurnItemId !== null;
         if (respondingTurnItemId) {
           setTurnMeta(respondingTurnItemId, "replying");
         }
@@ -466,7 +492,7 @@
         return;
 
       case "response.audio.delta":
-        if (connectionWantsAudio() && evt.delta) {
+        if (connectionWantsAudio() && acceptingResponseAudio && evt.delta) {
           queueAudioDelta(evt.delta);
         }
         return;
@@ -478,6 +504,7 @@
         return;
 
       case "response.done":
+        acceptingResponseAudio = false;
         if (respondingTurnItemId) {
           const responseStatus =
             (evt.response && evt.response.status) || "completed";
