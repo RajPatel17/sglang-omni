@@ -443,10 +443,14 @@
         return;
 
       case "input_audio_buffer.speech_started":
-        if (connectionWantsAudio() && respondingTurnItemId) {
-          wsSend({ type: "response.cancel" });
+        if (
+          connectionWantsAudio() &&
+          (respondingTurnItemId || playbackSources.size)
+        ) {
           interruptPlayback();
-          setTurnMeta(respondingTurnItemId, "interrupted");
+          if (respondingTurnItemId) {
+            setTurnMeta(respondingTurnItemId, "playback interrupted");
+          }
         }
         ensureTurn(evt.item_id);
         setTurnMeta(evt.item_id, `started ${ms(evt.audio_start_ms)}`);

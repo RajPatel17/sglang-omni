@@ -78,6 +78,8 @@ build step.
 - Text-only mode requests only the `text` modality.
 - Text + audio mode requests both modalities. Audio deltas are mono 24 kHz
   PCM16 little-endian and are queued with Web Audio for gapless playback.
+- When server VAD detects new speech, the browser immediately flushes queued
+  assistant playback so it does not feed back into the microphone.
 - The page does no error handling beyond updating the status line —
   matching the project's house style. If the WS drops mid-session,
   reconnect.
