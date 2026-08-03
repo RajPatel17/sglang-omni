@@ -100,6 +100,9 @@ class RealtimeSession:
 
         self.active_request_id: str | None = None
         self.active_task: asyncio.Task | None = None
+        self.active_response_task: asyncio.Task | None = None
+        self.active_response_request_id: str | None = None
+        self.response_cancel_requested = False
         self.cancel_cleanup_tasks: dict[asyncio.Task, asyncio.Task] = {}
         self.response_start_pending = False
         self.cancel_pending_response = False
@@ -244,18 +247,17 @@ class RealtimeSession:
         await self.send(make_event("input_audio_buffer.cleared"))
 
     async def handle_response_cancel(self, event: ResponseCancel) -> None:
-        if self.active_task is None or self.active_task.done():
-            return
-        task = self.active_task
         if self.response_start_pending:
             self.cancel_pending_response = True
             return
-        if self.active_request_id is None:
+        task = self.active_response_task
+        request_id = self.active_response_request_id
+        if task is None or task.done() or request_id is None:
             return
         cleanup_task = self.cancel_cleanup_tasks.get(task)
         if cleanup_task is not None and not cleanup_task.done():
             return
-        request_id = self.active_request_id
+        self.response_cancel_requested = True
         task.cancel()
         cleanup_task = asyncio.create_task(self._abort_and_drain(task, request_id))
         self.cancel_cleanup_tasks[task] = cleanup_task
@@ -279,7 +281,23 @@ class RealtimeSession:
         """Pass 1: response (user-facing, streams fast).
         Pass 2: transcription (background, fills history).
         """
-        response_text = await self.run_response(audio_payload)
+        self.active_response_task = asyncio.create_task(
+            self.run_response(audio_payload)
+        )
+        try:
+            response_text = await self.active_response_task
+        except asyncio.CancelledError:
+            turn_task = asyncio.current_task()
+            if (
+                not self.response_cancel_requested
+                or turn_task is None
+                or turn_task.cancelling()
+            ):
+                raise
+            response_text = ""
+        finally:
+            self.active_response_task = None
+            self.response_cancel_requested = False
         transcript = await self.run_transcription(item_id, audio_payload)
         # Append in chronological order: user spoke first, assistant replied.
         if transcript:
@@ -297,6 +315,7 @@ class RealtimeSession:
         resp_item_id = new_id("item")
         request_id = f"rt-{self.session_id}-{uuid.uuid4().hex}"
         self.active_request_id = request_id
+        self.active_response_request_id = request_id
         text_acc: list[str] = []
         finish_reason = "stop"
         usage: dict[str, Any] | None = None
@@ -321,6 +340,7 @@ class RealtimeSession:
             self.response_start_pending = False
             if self.cancel_pending_response:
                 self.cancel_pending_response = False
+                self.response_cancel_requested = True
                 await self.send(
                     make_event(
                         "response.text.done",
@@ -546,7 +566,10 @@ class RealtimeSession:
                 )
             return ""
         finally:
-            self.active_request_id = None
+            if self.active_request_id == request_id:
+                self.active_request_id = None
+            if self.active_response_request_id == request_id:
+                self.active_response_request_id = None
 
     async def _send_response_done(
         self,
