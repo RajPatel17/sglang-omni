@@ -375,7 +375,8 @@ class RealtimeSession:
                     )
 
                 if chunk.finish_reason is not None:
-                    finish_reason = chunk.finish_reason
+                    if chunk.modality == "text":
+                        finish_reason = chunk.finish_reason
                     if chunk.usage is not None:
                         usage = dataclasses.asdict(chunk.usage)
 
