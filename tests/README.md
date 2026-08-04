@@ -117,7 +117,8 @@ tests/
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
     ├── moss_tts/
-    │   └── test_pipeline.py
+    │   ├── test_pipeline.py
+    │   └── test_streaming_vocoder.py
     ├── moss_tts_local/
     │   ├── test_pipeline.py
     │   ├── test_radix_hash.py
@@ -502,7 +503,9 @@ that happened to contain an older version of the test.
   - OmniScheduler-backed AR/vocoder stage factory wiring
   - request mapping for `ref_audio`, `references`, and `token_count`
   - preprocessing handoff and abort cleanup behavior
-  - delay-pattern runner, codec splitting, and seeded sampling contracts.
+  - delay-pattern runner, codec splitting, and seeded sampling contracts
+  - incremental delay-row emission, bounded overlap decode parity, early-done
+    final-tail handling, and streaming abort cleanup.
 
 - `unit_test/moss_tts_local/`: MOSS-TTS Local unit tests:
   - pipeline config, request builders, and scheduler adapter contracts
