@@ -105,6 +105,8 @@ class RealtimeSession:
         self.active_response_has_audio = False
         self.cancelled_response_request_id: str | None = None
         self.cancelled_response_reason: str | None = None
+        self.finalized_response_request_id: str | None = None
+        self.response_state_lock = asyncio.Lock()
         self.active_response_abort_task: asyncio.Task | None = None
         self.response_start_pending = False
         self.pending_response_cancel_reason: str | None = None
@@ -269,17 +271,22 @@ class RealtimeSession:
         await self.cancel_active_response("client_cancelled")
 
     async def cancel_active_response(self, reason: str) -> None:
-        if self.response_start_pending:
-            if self.pending_response_cancel_reason is None:
-                self.pending_response_cancel_reason = reason
-            return
-        request_id = self.active_response_request_id
-        if request_id is None or self.cancelled_response_request_id == request_id:
-            return
-        # Mark first so already-buffered engine chunks are rejected while the
-        # abort propagates through the pipeline.
-        self.cancelled_response_request_id = request_id
-        self.cancelled_response_reason = reason
+        async with self.response_state_lock:
+            if self.response_start_pending:
+                if self.pending_response_cancel_reason is None:
+                    self.pending_response_cancel_reason = reason
+                return
+            request_id = self.active_response_request_id
+            if (
+                request_id is None
+                or self.finalized_response_request_id == request_id
+                or self.cancelled_response_request_id == request_id
+            ):
+                return
+            # Mark first so already-buffered engine chunks are rejected while
+            # the abort propagates through the pipeline.
+            self.cancelled_response_request_id = request_id
+            self.cancelled_response_reason = reason
 
         async def abort_request() -> None:
             try:
@@ -405,6 +412,12 @@ class RealtimeSession:
                 await terminal_task
                 raise
 
+        async def claim_terminal() -> bool:
+            async with self.response_state_lock:
+                cancelled = self.cancelled_response_request_id == request_id
+                self.finalized_response_request_id = request_id
+                return cancelled
+
         try:
             await self.send(
                 make_event(
@@ -418,12 +431,15 @@ class RealtimeSession:
                 )
             )
 
-            self.response_start_pending = False
-            if self.pending_response_cancel_reason is not None:
+            async with self.response_state_lock:
+                self.response_start_pending = False
                 reason = self.pending_response_cancel_reason
                 self.pending_response_cancel_reason = None
-                self.cancelled_response_request_id = request_id
-                self.cancelled_response_reason = reason
+                if reason is not None:
+                    self.cancelled_response_request_id = request_id
+                    self.cancelled_response_reason = reason
+            if reason is not None:
+                await claim_terminal()
                 await emit_terminals_safely(
                     response_text="",
                     include_audio=False,
@@ -507,7 +523,8 @@ class RealtimeSession:
                     audio_done = True
 
             response_text = "".join(text_acc)
-            if self.cancelled_response_request_id == request_id:
+            cancelled = await claim_terminal()
+            if cancelled:
                 await emit_terminals_safely(
                     response_text=response_text,
                     include_audio=wants_audio and saw_audio,
@@ -539,6 +556,7 @@ class RealtimeSession:
             return response_text
         except asyncio.CancelledError:
             if not response_done:
+                await claim_terminal()
                 await emit_terminals_safely(
                     response_text="".join(text_acc),
                     include_audio=wants_audio and saw_audio,
@@ -548,7 +566,7 @@ class RealtimeSession:
             raise
         except Exception as exc:
             response_text = "".join(text_acc)
-            cancelled = self.cancelled_response_request_id == request_id
+            cancelled = await claim_terminal()
             if not cancelled:
                 asyncio.get_running_loop().call_exception_handler(
                     {
@@ -580,12 +598,15 @@ class RealtimeSession:
         finally:
             if self.active_request_id == request_id:
                 self.active_request_id = None
-            if self.active_response_request_id == request_id:
-                self.active_response_request_id = None
-                self.active_response_has_audio = False
-            if self.cancelled_response_request_id == request_id:
-                self.cancelled_response_request_id = None
-                self.cancelled_response_reason = None
+            async with self.response_state_lock:
+                if self.active_response_request_id == request_id:
+                    self.active_response_request_id = None
+                    self.active_response_has_audio = False
+                if self.cancelled_response_request_id == request_id:
+                    self.cancelled_response_request_id = None
+                    self.cancelled_response_reason = None
+                if self.finalized_response_request_id == request_id:
+                    self.finalized_response_request_id = None
 
     async def _send_response_done(
         self,
