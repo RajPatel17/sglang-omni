@@ -66,7 +66,7 @@ test("interrupt stops playback and rejects late audio", () => {
 
   assert.deepEqual(playback.interrupt(), ["response-a"]);
   assert.equal(contexts[0].sources[0].stopped, true);
-  assert.equal(contexts[0].closed, true);
+  assert.equal(contexts[0].closed, false);
   assert.equal(playback.queueAudioDelta("late", "response-a"), false);
 });
 
@@ -80,12 +80,23 @@ test("speech can interrupt playback after response generation completed", () => 
 });
 
 test("a new response can play after an interrupted response", () => {
-  const { playback } = controller();
+  const { playback, contexts } = controller();
   playback.beginResponse("response-a");
+  playback.queueAudioDelta("audio", "response-a");
   playback.interrupt();
   playback.beginResponse("response-b");
 
   assert.equal(playback.queueAudioDelta("audio", "response-b"), true);
+  assert.equal(contexts.length, 1);
+});
+
+test("explicit close releases the audio context", () => {
+  const { playback, contexts } = controller();
+  playback.ensureContext();
+
+  playback.close();
+
+  assert.equal(contexts[0].closed, true);
 });
 
 test("pending-start interruption marks the later response stale", () => {

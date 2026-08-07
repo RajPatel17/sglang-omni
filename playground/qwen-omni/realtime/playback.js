@@ -105,19 +105,23 @@
       return true;
     }
 
-    flush() {
+    flush(closeContext = false) {
       this.sources.forEach((source) => {
         try {
           source.stop();
         } catch (_) {}
       });
       this.sources.clear();
-      if (this.context) {
+      if (closeContext && this.context) {
         this.context.close();
         this.context = null;
       }
       this.playbackResponseId = null;
-      this.nextPlaybackTime = 0;
+      this.nextPlaybackTime = this.context ? this.context.currentTime : 0;
+    }
+
+    close() {
+      this.flush(true);
     }
   }
 

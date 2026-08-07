@@ -322,7 +322,7 @@
   }
 
   function stopPlayback() {
-    playback.flush();
+    playback.close();
     turns.clear();
     pendingResponseInterrupted = false;
   }
