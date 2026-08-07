@@ -81,11 +81,18 @@ build step.
 - Server-owned barge-in is the default behavior for text-plus-audio sessions.
   The server cancels the active response when new speech starts, while the
   browser stops queued PCM playback. The interrupted user transcription remains
-  in conversation history before the next queued response starts.
+  in conversation history before the next queued response starts. Cancelled
+  assistant output is not retained because the server cannot know which locally
+  buffered samples were played.
 - Text-only mode keeps its existing behavior and finishes the active response.
 - Custom realtime applications get the same behavior by requesting
-  `["text", "audio"]`. They must also stop any assistant audio already buffered
-  for local playback when they receive `input_audio_buffer.speech_started`.
+  `["text", "audio"]`. On `input_audio_buffer.speech_started`, they must stop
+  buffered playback and reject later `response.audio.delta` events for the
+  interrupted response until `response.done`. If speech starts before
+  `response.created`, retain a pending-interruption flag and reject that response
+  once its ID arrives.
+- Automatic interruption ends with `response.done.status="cancelled"` and
+  reason `turn_detected`; explicit `response.cancel` uses `client_cancelled`.
 - To opt out for a specific audio session, set:
 
   ```json
@@ -100,6 +107,9 @@ build step.
     }
   }
   ```
+- Only `turn_detection.interrupt_response` is applied dynamically. The endpoint
+  constructs server VAD once with fixed defaults; `threshold`,
+  `prefix_padding_ms`, and `silence_duration_ms` do not reconfigure it.
 - The standalone `/v1/audio/speech` TTS API is unchanged because it does not
   have a live microphone/VAD session to trigger barge-in.
 - The page does no error handling beyond updating the status line —

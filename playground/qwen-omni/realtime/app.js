@@ -47,24 +47,17 @@
   let workletNode = null;
   let analyserNode = null;
   let drawRaf = 0;
-  let playbackCtx = null;
-  let nextPlaybackTime = 0;
-  let acceptingResponseAudio = false;
-  const playbackSources = new Map();
-  const interruptedTurnItemIds = new Set();
   let activeModalities = null;
   let sessionReady = false;
   let turnCounter = 0;
   // Each turn card is keyed by the audio item_id minted at speech_started /
   // committed.
   const turnCards = new Map();           // item_id → DOM node
-  // response.text.delta events have no item_id link to the audio. Server
-  // serializes turns, so we maintain a FIFO of audio item_ids queued for a
-  // response and bind one to each response.created.
-  const pendingAudioForResponse = [];    // queue of item_ids awaiting response
-  let respondingTurnItemId = null;       // item_id of the response currently streaming
   const TARGET_SR = 16000;
   const OUTPUT_SR = 24000;
+  const playback = new RealtimePlaybackController({ sampleRate: OUTPUT_SR });
+  const turns = new RealtimeTurnTracker();
+  let pendingResponseInterrupted = false;
 
   // ─────────────────────  Status helpers  ─────────────────────
 
@@ -132,7 +125,7 @@
     sessionReady = false;
     stopPlayback();
     if (connectionWantsAudio()) {
-      ensurePlaybackContext();
+      playback.ensureContext();
     }
     outputModeEl.disabled = true;
     ws = new WebSocket(url);
@@ -185,12 +178,11 @@
   });
 
   function clearTurns() {
-    interruptPlayback();
-    interruptedTurnItemIds.clear();
+    playback.flush();
+    turns.clear();
+    pendingResponseInterrupted = false;
     turnCards.clear();
     turnCounter = 0;
-    pendingAudioForResponse.length = 0;
-    respondingTurnItemId = null;
     transcriptsEl.innerHTML =
       '<p class="empty-state">The wire is quiet. Open it, then speak.</p>';
   }
@@ -306,73 +298,16 @@
     return btoa(binary);
   }
 
-  function base64ToBytes(encoded) {
-    const binary = atob(encoded);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  }
-
-  function ensurePlaybackContext() {
-    if (!playbackCtx || playbackCtx.state === "closed") {
-      playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
-      nextPlaybackTime = 0;
-    }
-    if (playbackCtx.state === "suspended") {
-      playbackCtx.resume();
-    }
-    return playbackCtx;
-  }
-
-  function queueAudioDelta(encoded) {
-    if (!acceptingResponseAudio || !respondingTurnItemId) return;
-    const bytes = base64ToBytes(encoded);
-    if (bytes.byteLength % 2 !== 0) {
-      throw new Error("Received an odd-length PCM16 audio delta");
-    }
-
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const samples = new Float32Array(bytes.byteLength / 2);
-    for (let i = 0; i < samples.length; i++) {
-      samples[i] = view.getInt16(i * 2, true) / 0x8000;
-    }
-
-    const ctx = ensurePlaybackContext();
-    const buffer = ctx.createBuffer(1, samples.length, OUTPUT_SR);
-    buffer.copyToChannel(samples, 0);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    playbackSources.set(source, respondingTurnItemId);
-    source.onended = () => playbackSources.delete(source);
-
-    const startAt = Math.max(ctx.currentTime + 0.02, nextPlaybackTime);
-    source.start(startAt);
-    nextPlaybackTime = startAt + buffer.duration;
-  }
-
-  function interruptPlayback() {
-    acceptingResponseAudio = false;
-    const interruptedItemIds = new Set(playbackSources.values());
-    if (respondingTurnItemId) {
-      interruptedItemIds.add(respondingTurnItemId);
-    }
-    for (const source of Array.from(playbackSources.keys())) {
-      try {
-        source.stop();
-      } catch (_) {
-        // The source may have already ended between iteration and stop().
-      }
-    }
-    playbackSources.clear();
-    nextPlaybackTime = playbackCtx ? playbackCtx.currentTime : 0;
-    return interruptedItemIds;
+  function responseIdOf(evt) {
+    return (
+      evt.response_id ||
+      (evt.response && evt.response.id) ||
+      null
+    );
   }
 
   function markTurnInterrupted(itemId) {
-    interruptedTurnItemIds.add(itemId);
+    if (!itemId) return;
     const node = turnCards.get(itemId);
     const responseStatus = node && node.dataset.state;
     const terminal = responseStatus && responseStatus !== "in-progress";
@@ -384,21 +319,12 @@
         ? `${terminalLabel} · interrupted`
         : "response interrupted",
     );
-    if (terminal) {
-      interruptedTurnItemIds.delete(itemId);
-    }
   }
 
   function stopPlayback() {
-    interruptPlayback();
-    interruptedTurnItemIds.clear();
-    pendingAudioForResponse.length = 0;
-    respondingTurnItemId = null;
-    if (playbackCtx) {
-      playbackCtx.close();
-      playbackCtx = null;
-    }
-    nextPlaybackTime = 0;
+    playback.flush();
+    turns.clear();
+    pendingResponseInterrupted = false;
   }
 
   // ─────────────────────  Oscilloscope  ─────────────────────
@@ -472,9 +398,15 @@
         return;
 
       case "input_audio_buffer.speech_started":
-        if (connectionWantsAudio() && (respondingTurnItemId || playbackSources.size)) {
-          for (const itemId of interruptPlayback()) {
-            markTurnInterrupted(itemId);
+        if (connectionWantsAudio()) {
+          const interruptedResponseIds = playback.interrupt();
+          if (interruptedResponseIds.length) {
+            for (const responseId of interruptedResponseIds) {
+              const itemId = turns.interruptResponse(responseId);
+              markTurnInterrupted(itemId);
+            }
+          } else if (turns.hasPendingResponse()) {
+            pendingResponseInterrupted = true;
           }
         }
         ensureTurn(evt.item_id);
@@ -482,90 +414,105 @@
         return;
 
       case "input_audio_buffer.speech_stopped":
+        pendingResponseInterrupted = false;
         setTurnMeta(evt.item_id, `stopped ${ms(evt.audio_end_ms)}`);
         return;
 
       case "input_audio_buffer.committed":
         ensureTurn(evt.item_id);
         setTurnMeta(evt.item_id, "committed · awaiting reply");
-        // Queue this turn for the next response.created — server processes
-        // commits serially so FIFO is correct.
-        pendingAudioForResponse.push(evt.item_id);
+        turns.commit(evt.item_id);
         return;
 
       // ── Pass 1: assistant reply (streams first) ──
-      case "response.created":
-        respondingTurnItemId = pendingAudioForResponse.shift() || null;
-        acceptingResponseAudio =
-          connectionWantsAudio() && respondingTurnItemId !== null;
-        if (respondingTurnItemId) {
-          setTurnMeta(respondingTurnItemId, "replying");
+      case "response.created": {
+        const responseId = responseIdOf(evt);
+        const binding = turns.beginResponse(
+          responseId,
+          pendingResponseInterrupted,
+        );
+        pendingResponseInterrupted = false;
+        if (!responseId || !binding.itemId) {
+          playback.rejectResponse(responseId);
+        } else if (binding.interrupted) {
+          playback.rejectResponse(responseId);
+          markTurnInterrupted(binding.itemId);
+        } else {
+          playback.beginResponse(responseId);
+          setTurnMeta(binding.itemId, "replying");
         }
         return;
+      }
 
-      case "response.text.delta":
-        if (respondingTurnItemId) {
-          appendToBody(respondingTurnItemId, "assistant-body", evt.delta || "");
+      case "response.text.delta": {
+        const responseId = responseIdOf(evt);
+        if (turns.ownsResponse(responseId)) {
+          appendToBody(turns.respondingItemId, "assistant-body", evt.delta || "");
         }
         return;
+      }
 
-      case "response.text.done":
-        if (
-          respondingTurnItemId &&
-          !interruptedTurnItemIds.has(respondingTurnItemId)
-        ) {
+      case "response.text.done": {
+        const responseId = responseIdOf(evt);
+        if (turns.ownsResponse(responseId)) {
           setTurnMeta(
-            respondingTurnItemId,
+            turns.respondingItemId,
             connectionWantsAudio()
               ? "reply streaming"
               : "reply done · transcribing",
           );
         }
         return;
+      }
 
-      case "response.audio.delta":
-        if (connectionWantsAudio() && acceptingResponseAudio && evt.delta) {
-          queueAudioDelta(evt.delta);
-        }
-        return;
-
-      case "response.audio.done":
+      case "response.audio.delta": {
+        const responseId = responseIdOf(evt);
         if (
-          respondingTurnItemId &&
-          !interruptedTurnItemIds.has(respondingTurnItemId)
+          connectionWantsAudio() &&
+          turns.ownsResponse(responseId) &&
+          evt.delta
         ) {
-          setTurnMeta(respondingTurnItemId, "reply streaming");
+          playback.queueAudioDelta(evt.delta, responseId);
         }
         return;
+      }
 
-      case "response.done":
-        acceptingResponseAudio = false;
-        if (respondingTurnItemId) {
-          const completedItemId = respondingTurnItemId;
-          const responseStatus =
-            (evt.response && evt.response.status) || "completed";
-          const node = turnCards.get(completedItemId);
+      case "response.audio.done": {
+        const responseId = responseIdOf(evt);
+        if (turns.ownsResponse(responseId)) {
+          setTurnMeta(turns.respondingItemId, "reply streaming");
+        }
+        return;
+      }
+
+      case "response.done": {
+        const responseId = responseIdOf(evt);
+        const responseStatus =
+          (evt.response && evt.response.status) || "completed";
+        const result = turns.finishResponse(responseId);
+        playback.finishResponse(responseId, responseStatus);
+        if (result.itemId) {
+          const node = turnCards.get(result.itemId);
           if (node) node.dataset.state = responseStatus;
-          if (interruptedTurnItemIds.has(completedItemId)) {
+          if (result.interrupted) {
             setTurnMeta(
-              completedItemId,
+              result.itemId,
               responseStatus === "completed"
                 ? "complete · interrupted"
                 : `${responseStatus} · interrupted`,
             );
-            interruptedTurnItemIds.delete(completedItemId);
           } else if (
             connectionWantsAudio() ||
             responseStatus !== "completed"
           ) {
             setTurnMeta(
-              completedItemId,
+              result.itemId,
               responseStatus === "completed" ? "complete" : responseStatus,
             );
           }
         }
-        respondingTurnItemId = null;
         return;
+      }
 
       // In text-only mode, render the incremental user transcript.
       case "conversation.item.input_audio_transcription.delta":
