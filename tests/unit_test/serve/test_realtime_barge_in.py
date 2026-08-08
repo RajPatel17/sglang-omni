@@ -94,6 +94,7 @@ async def test_abort_finishes_before_transcription_and_omits_cancelled_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response_started = asyncio.Event()
+    abort_started = asyncio.Event()
     allow_abort = asyncio.Event()
     abort_done = asyncio.Event()
     transcription_started = asyncio.Event()
@@ -114,19 +115,25 @@ async def test_abort_finishes_before_transcription_and_omits_cancelled_history(
     session, websocket, client = _session(monkeypatch, [response, transcription])
 
     async def abort() -> None:
+        abort_started.set()
         await allow_abort.wait()
         abort_done.set()
 
     client.abort_hook = abort
     turn = asyncio.create_task(session.run_turn("item-user", "audio"))
     await response_started.wait()
-    cancel = asyncio.create_task(session.cancel_active_response("turn_detected"))
+    cancel = asyncio.create_task(
+        session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    )
+    await abort_started.wait()
     await asyncio.sleep(0)
+    dispatch_returned_before_abort = cancel.done()
     assert not transcription_started.is_set()
     allow_abort.set()
     await cancel
     await turn
 
+    assert dispatch_returned_before_abort
     assert [item.text for item in session.conversation] == ["original question"]
     types = [event["type"] for event in websocket.events]
     assert types.count("response.text.done") == 1
@@ -136,6 +143,88 @@ async def test_abort_finishes_before_transcription_and_omits_cancelled_history(
         e["response"] for e in websocket.events if e["type"] == "response.done"
     )
     assert response["status_details"]["reason"] == "turn_detected"
+
+
+@pytest.mark.asyncio
+async def test_failed_abort_cancels_local_response_before_transcription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_started = asyncio.Event()
+    release_response = asyncio.Event()
+    transcription_started = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        response_started.set()
+        yield _chunk(text="partial")
+        yield _chunk(modality="audio")
+        await release_response.wait()
+        yield _chunk(finish_reason="stop")
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        transcription_started.set()
+        yield _chunk(text="original question")
+        yield _chunk(finish_reason="stop")
+
+    session, websocket, client = _session(monkeypatch, [response, transcription])
+
+    async def abort() -> None:
+        raise RuntimeError("abort failed")
+
+    client.abort_hook = abort
+    turn = asyncio.create_task(session.run_turn("item-user", "audio"))
+    await response_started.wait()
+    await session.dispatch({"type": "response.cancel"})
+
+    try:
+        await asyncio.wait_for(transcription_started.wait(), 0.05)
+        transcription_started_before_stream_end = True
+    except TimeoutError:
+        transcription_started_before_stream_end = False
+    terminal_count_before_stream_end = sum(
+        event["type"] == "response.done" for event in websocket.events
+    )
+
+    release_response.set()
+    await turn
+
+    assert transcription_started_before_stream_end
+    assert terminal_count_before_stream_end == 1
+    response_done = next(
+        event["response"]
+        for event in websocket.events
+        if event["type"] == "response.done"
+    )
+    assert response_done["status_details"]["reason"] == "client_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_during_transcription_is_a_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcription_started = asyncio.Event()
+    release_transcription = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="answer")
+        yield _chunk(finish_reason="stop")
+        yield _chunk(modality="audio")
+        yield _chunk(modality="audio", finish_reason="stop")
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        transcription_started.set()
+        await release_transcription.wait()
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    session, _, client = _session(monkeypatch, [response, transcription])
+    turn = asyncio.create_task(session.run_turn("item-user", "audio"))
+    await transcription_started.wait()
+
+    await session.dispatch({"type": "response.cancel"})
+
+    assert client.aborted == []
+    release_transcription.set()
+    await turn
 
 
 @pytest.mark.asyncio

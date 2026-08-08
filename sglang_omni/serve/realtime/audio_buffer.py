@@ -46,6 +46,11 @@ class RealtimeAudioBuffer:
     def clear(self) -> None:
         self.buf.clear()
 
+    def discard_prefix(self, num_bytes: int) -> None:
+        if num_bytes < 0 or num_bytes > len(self.buf):
+            raise ValueError("num_bytes must identify a prefix in the buffer")
+        del self.buf[:num_bytes]
+
     @property
     def num_bytes(self) -> int:
         return len(self.buf)

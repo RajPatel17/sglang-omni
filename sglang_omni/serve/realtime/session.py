@@ -101,8 +101,11 @@ class RealtimeSession:
 
         self.active_request_id: str | None = None
         self.active_task: asyncio.Task | None = None
+        self.active_response_task: asyncio.Task[str] | None = None
         self.active_response_request_id: str | None = None
         self.active_response_has_audio = False
+        self.response_cancel_reason: str | None = None
+        self.turn_cancel_requested = False
         self.cancelled_response_request_id: str | None = None
         self.cancelled_response_reason: str | None = None
         self.finalized_response_request_id: str | None = None
@@ -123,6 +126,9 @@ class RealtimeSession:
         # Session-wall-clock sample offset of buffer byte 0; advances on
         # commit so speech timestamps stay correct after a buffer drop.
         self.buffer_origin_samples = 0
+        # Session-wall-clock sample offset where the current VAD epoch began.
+        # Automatic commits retain VAD state, so this can precede the buffer.
+        self.vad_origin_samples = 0
         self.utterance_start_byte: int | None = None
         # speech_started.item_id predicts the eventual committed id so
         # clients can align live VAD events to the transcript.
@@ -157,9 +163,16 @@ class RealtimeSession:
     async def handle_session_update(self, event: SessionUpdate) -> None:
         # Validate a candidate first so a rejected update never lands in live state.
         update = event.session.model_dump(exclude_none=True, exclude_unset=True)
-        candidate = SessionObject.model_validate(
-            self.session_object.model_dump() | update
-        )
+        current = self.session_object.model_dump()
+        turn_detection_update = update.get("turn_detection")
+        if (
+            turn_detection_update is not None
+            and current.get("turn_detection") is not None
+        ):
+            update["turn_detection"] = (
+                current["turn_detection"] | turn_detection_update
+            )
+        candidate = SessionObject.model_validate(current | update)
         modalities = set(candidate.modalities)
         if modalities not in ({"text"}, {"text", "audio"}):
             await self.send_error(
@@ -200,11 +213,14 @@ class RealtimeSession:
             await self.handle_vad_emit(emit)
 
     async def handle_vad_emit(self, emit: Any) -> None:
-        timestamp_ms = offsets_to_ms(self.buffer_origin_samples + emit.sample_offset)
+        absolute_sample = self.vad_origin_samples + emit.sample_offset
+        timestamp_ms = offsets_to_ms(absolute_sample)
         if emit.event_type == VADEvent.SPEECH_STARTED:
             self.speech_idle.clear()
             # PCM16 mono: 2 bytes/sample.
-            vad_byte = max(0, emit.sample_offset * 2)
+            vad_byte = max(
+                0, (absolute_sample - self.buffer_origin_samples) * 2
+            )
             self.utterance_start_byte = min(vad_byte, self.audio_buffer.num_bytes)
             self.utterance_item_id = new_id("item")
             await self.send(
@@ -233,29 +249,36 @@ class RealtimeSession:
                 )
             )
             try:
-                await self.auto_commit_utterance(emit.sample_offset)
+                await self.auto_commit_utterance(absolute_sample)
             finally:
                 self.speech_idle.set()
 
     def drop_buffer_and_reset_vad(self) -> None:
         self.buffer_origin_samples += self.audio_buffer.num_samples
+        self.vad_origin_samples = self.buffer_origin_samples
         self.audio_buffer.clear()
         self.utterance_start_byte = None
         self.utterance_item_id = None
         self.vad.reset()
 
-    async def auto_commit_utterance(self, end_sample_offset: int) -> None:
+    async def auto_commit_utterance(self, end_sample: int) -> None:
         if self.audio_buffer.is_empty():
             return
         start_byte = self.utterance_start_byte or 0
-        end_byte = min(end_sample_offset * 2, self.audio_buffer.num_bytes)
+        end_byte = min(
+            max(0, (end_sample - self.buffer_origin_samples) * 2),
+            self.audio_buffer.num_bytes,
+        )
         if end_byte <= start_byte:
             return
         payload = self.audio_buffer.to_sliced_wav_data_uri(
             start_byte=start_byte, end_byte=end_byte
         )
         item_id = self.utterance_item_id or new_id("item")
-        self.drop_buffer_and_reset_vad()
+        self.audio_buffer.discard_prefix(end_byte)
+        self.buffer_origin_samples += end_byte // 2
+        self.utterance_start_byte = None
+        self.utterance_item_id = None
 
         await self.send(make_event("input_audio_buffer.committed", item_id=item_id))
         await self.response_queue.put((item_id, payload))
@@ -287,6 +310,11 @@ class RealtimeSession:
             # the abort propagates through the pipeline.
             self.cancelled_response_request_id = request_id
             self.cancelled_response_reason = reason
+            self.response_cancel_reason = reason
+            response_task = self.active_response_task
+
+        if response_task is not None and not response_task.done():
+            response_task.cancel()
 
         async def abort_request() -> None:
             try:
@@ -301,11 +329,11 @@ class RealtimeSession:
 
         abort_task = asyncio.create_task(abort_request())
         self.active_response_abort_task = abort_task
-        try:
-            await abort_task
-        finally:
-            if self.active_response_abort_task is abort_task:
-                self.active_response_abort_task = None
+        abort_task.add_done_callback(self._clear_active_response_abort_task)
+
+    def _clear_active_response_abort_task(self, task: asyncio.Task[None]) -> None:
+        if self.active_response_abort_task is task:
+            self.active_response_abort_task = None
 
     async def drain_queue(self) -> None:
         while not self.closed:
@@ -326,7 +354,19 @@ class RealtimeSession:
         """Pass 1: response (user-facing, streams fast).
         Pass 2: transcription (background, fills history).
         """
-        response_text = await self.run_response(audio_payload)
+        self.turn_cancel_requested = False
+        self.active_response_task = asyncio.create_task(
+            self.run_response(audio_payload)
+        )
+        try:
+            response_text = await self.active_response_task
+        except asyncio.CancelledError:
+            if self.response_cancel_reason is None or self.turn_cancel_requested:
+                raise
+            response_text = ""
+        finally:
+            self.active_response_task = None
+            self.response_cancel_reason = None
         abort_task = self.active_response_abort_task
         if abort_task is not None:
             await asyncio.shield(abort_task)
@@ -776,6 +816,7 @@ class RealtimeSession:
 
     async def teardown(self) -> None:
         self.closed = True
+        self.turn_cancel_requested = True
         abort_task = self.active_response_abort_task
         await self._cancel_and_abort(self.active_task, self.active_request_id)
         if abort_task is not None:
