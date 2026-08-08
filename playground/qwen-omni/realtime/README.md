@@ -58,6 +58,14 @@ build step.
    and start speaking. The output mode is locked for the duration of the
    connection. **Text + audio** requires one of the speech-server configurations.
 
+## Test
+
+Run the browser-side playback state regressions from the repository root:
+
+```bash
+node --test playground/qwen-omni/realtime/playback.test.js
+```
+
 ## What you'll see
 
 | UI panel | Meaning |

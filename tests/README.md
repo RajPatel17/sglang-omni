@@ -544,6 +544,10 @@ that happened to contain an older version of the test.
   - generation-stage SGLang server-args role mapping and CLI override capability boundaries
   - OpenAI-compatible request/response behavior
   - streaming response framing and failure semantics.
+  - realtime barge-in cancellation, partial session updates, terminal races,
+    VAD stop-to-start segmentation, and assistant-history truncation.
+  - Browser-side realtime playback state is covered separately by
+    `playground/qwen-omni/realtime/playback.test.js`.
 
 - `unit_test/fishaudio_s2_pro/`: FishAudio S2-Pro unit tests:
   - inference prompt segmentation, reference VQ edge cases, and state contracts

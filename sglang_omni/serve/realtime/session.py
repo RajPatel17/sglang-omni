@@ -136,9 +136,8 @@ class RealtimeSession:
         # Session-wall-clock sample offset of buffer byte 0; advances on
         # commit so speech timestamps stay correct after a buffer drop.
         self.buffer_origin_samples = 0
-        # Note (Wenyao): This is the session-wall-clock sample where the current
-        # VAD epoch began. Automatic commits retain VAD state, so it can precede
-        # the buffer origin.
+        # Note (Wenyao): VAD offsets remain relative to the last reset even when
+        # automatic commits advance the audio-buffer origin.
         self.vad_origin_samples = 0
         self.utterance_start_byte: int | None = None
         # speech_started.item_id predicts the eventual committed id so
