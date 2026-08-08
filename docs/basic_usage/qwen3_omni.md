@@ -315,8 +315,7 @@ For text-and-audio sessions, server-owned barge-in is enabled by default. When
 server VAD emits `input_audio_buffer.speech_started`, the active response is
 cancelled with reason `turn_detected`; its user transcription still completes
 and enters conversation history before the next queued turn runs. Cancelled
-assistant output is not added to conversation history because the server cannot
-know which locally buffered samples were actually played.
+assistant output is not added to conversation history.
 
 Clients must stop buffered playback on `speech_started` and reject every later
 `response.audio.delta` for that response until its `response.done`. If speech
@@ -324,6 +323,13 @@ starts before `response.created`, retain a pending-interruption flag and reject
 the response when its ID arrives. Automatic barge-in ends with
 `response.done.status="cancelled"` and reason `turn_detected`; explicit
 `response.cancel` uses reason `client_cancelled`.
+
+If assistant audio has already been scheduled for playback, the client must
+also send `conversation.item.truncate` with the assistant `item_id` from
+`response.audio.delta`, `content_index: 0`, and the played duration in
+`audio_end_ms`. The server replies with `conversation.item.truncated` and
+removes that assistant item from conversation history. The whole assistant
+transcript is removed because the endpoint cannot align text with played audio.
 
 Set `turn_detection.interrupt_response` to `false` in `session.update` to opt
 out. This is the only `turn_detection` field applied dynamically by the current

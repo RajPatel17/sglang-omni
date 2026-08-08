@@ -82,8 +82,7 @@ build step.
   The server cancels the active response when new speech starts, while the
   browser stops queued PCM playback. The interrupted user transcription remains
   in conversation history before the next queued response starts. Cancelled
-  assistant output is not retained because the server cannot know which locally
-  buffered samples were played.
+  assistant output is not retained.
 - Text-only mode keeps its existing behavior and finishes the active response.
 - Custom realtime applications get the same behavior by requesting
   `["text", "audio"]`. On `input_audio_buffer.speech_started`, they must stop
@@ -91,6 +90,12 @@ build step.
   interrupted response until `response.done`. If speech starts before
   `response.created`, retain a pending-interruption flag and reject that response
   once its ID arrives.
+- If playback is interrupted after assistant audio has been scheduled, send
+  `conversation.item.truncate` with the assistant `item_id` from
+  `response.audio.delta`, `content_index: 0`, and the played duration in
+  `audio_end_ms`. The server replies with `conversation.item.truncated` and
+  removes that assistant item from conversation history. It removes the whole
+  assistant transcript because audio and text are not aligned.
 - Automatic interruption ends with `response.done.status="cancelled"` and
   reason `turn_detected`; explicit `response.cancel` uses `client_cancelled`.
 - To opt out for a specific audio session, set:

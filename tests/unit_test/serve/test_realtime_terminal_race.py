@@ -80,7 +80,7 @@ async def test_completion_wins_if_cancel_arrives_during_terminal_send(
     await session.cancel_active_response("turn_detected")
     websocket.release_terminal.set()
 
-    assert await response == "answer"
+    assert (await response).text == "answer"
     assert client.aborted == []
     done = next(
         event["response"]

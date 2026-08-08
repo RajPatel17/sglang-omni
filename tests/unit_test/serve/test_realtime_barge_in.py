@@ -258,7 +258,7 @@ async def test_pending_response_is_cancelled_before_stream_start(
     session.response_start_pending = True
     await session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
 
-    assert await session.run_response("audio") == ""
+    assert (await session.run_response("audio")).text == ""
     assert client.requests == []
     response = next(
         e["response"] for e in websocket.events if e["type"] == "response.done"

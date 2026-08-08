@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketState
 from sglang_omni.client import Client, GenerateRequest, Message, SamplingParams
 from sglang_omni.serve.realtime.audio_buffer import RealtimeAudioBuffer
 from sglang_omni.serve.realtime.events import (
+    ConversationItemTruncate,
     InputAudioBufferAppend,
     InputAudioBufferClear,
     ResponseCancel,
@@ -44,6 +45,7 @@ HANDLERS: dict[type, str] = {
     InputAudioBufferAppend: "handle_audio_append",
     InputAudioBufferClear: "handle_audio_clear",
     ResponseCancel: "handle_response_cancel",
+    ConversationItemTruncate: "handle_conversation_item_truncate",
 }
 
 
@@ -54,6 +56,13 @@ def new_id(prefix: str) -> str:
 @dataclass
 class ConversationItem:
     role: str  # "user" | "assistant"
+    text: str
+    item_id: str | None = None
+
+
+@dataclass
+class ResponseOutput:
+    item_id: str
     text: str
 
 
@@ -67,8 +76,8 @@ class RealtimeSession:
          prompt, streams ``conversation.item.input_audio_transcription.*`` for
          history/UI/log.
       3. The transcript and completed assistant response are appended to
-         ``self.conversation``. Cancelled assistant output is omitted because
-         the server cannot know which locally buffered samples were played.
+         ``self.conversation``. Cancelled assistant output is omitted, and a
+         client truncate event removes completed output interrupted in playback.
     """
 
     def __init__(
@@ -95,13 +104,12 @@ class RealtimeSession:
         )
 
         self.audio_buffer = RealtimeAudioBuffer(source_sr=16000, target_sr=16000)
-        # (role, text) records — fed back as message history on the next turn.
         self.conversation: list[ConversationItem] = []
         self.closed = False
 
         self.active_request_id: str | None = None
         self.active_task: asyncio.Task | None = None
-        self.active_response_task: asyncio.Task[str] | None = None
+        self.active_response_task: asyncio.Task[ResponseOutput] | None = None
         self.active_response_request_id: str | None = None
         self.active_response_has_audio = False
         self.response_cancel_reason: str | None = None
@@ -113,6 +121,8 @@ class RealtimeSession:
         self.active_response_abort_task: asyncio.Task | None = None
         self.response_start_pending = False
         self.pending_response_cancel_reason: str | None = None
+        self.pending_assistant_item_ids: set[str] = set()
+        self.truncated_assistant_item_ids: set[str] = set()
         self.speech_idle = asyncio.Event()
         self.speech_idle.set()
         # VAD may emit speech_stopped while engine is still busy on an
@@ -126,8 +136,9 @@ class RealtimeSession:
         # Session-wall-clock sample offset of buffer byte 0; advances on
         # commit so speech timestamps stay correct after a buffer drop.
         self.buffer_origin_samples = 0
-        # Session-wall-clock sample offset where the current VAD epoch began.
-        # Automatic commits retain VAD state, so this can precede the buffer.
+        # Note (Wenyao): This is the session-wall-clock sample where the current
+        # VAD epoch began. Automatic commits retain VAD state, so it can precede
+        # the buffer origin.
         self.vad_origin_samples = 0
         self.utterance_start_byte: int | None = None
         # speech_started.item_id predicts the eventual committed id so
@@ -169,9 +180,7 @@ class RealtimeSession:
             turn_detection_update is not None
             and current.get("turn_detection") is not None
         ):
-            update["turn_detection"] = (
-                current["turn_detection"] | turn_detection_update
-            )
+            update["turn_detection"] = current["turn_detection"] | turn_detection_update
         candidate = SessionObject.model_validate(current | update)
         modalities = set(candidate.modalities)
         if modalities not in ({"text"}, {"text", "audio"}):
@@ -218,9 +227,7 @@ class RealtimeSession:
         if emit.event_type == VADEvent.SPEECH_STARTED:
             self.speech_idle.clear()
             # PCM16 mono: 2 bytes/sample.
-            vad_byte = max(
-                0, (absolute_sample - self.buffer_origin_samples) * 2
-            )
+            vad_byte = max(0, (absolute_sample - self.buffer_origin_samples) * 2)
             self.utterance_start_byte = min(vad_byte, self.audio_buffer.num_bytes)
             self.utterance_item_id = new_id("item")
             await self.send(
@@ -293,6 +300,46 @@ class RealtimeSession:
     async def handle_response_cancel(self, event: ResponseCancel) -> None:
         await self.cancel_active_response("client_cancelled")
 
+    async def handle_conversation_item_truncate(
+        self, event: ConversationItemTruncate
+    ) -> None:
+        if event.content_index != 0:
+            await self.send_error(
+                "invalid_request_error",
+                "invalid_content_index",
+                "content_index must be 0.",
+            )
+            return
+
+        if event.item_id in self.pending_assistant_item_ids:
+            self.truncated_assistant_item_ids.add(event.item_id)
+        else:
+            item_index = next(
+                (
+                    index
+                    for index, item in enumerate(self.conversation)
+                    if item.item_id == event.item_id and item.role == "assistant"
+                ),
+                None,
+            )
+            if item_index is None:
+                await self.send_error(
+                    "invalid_request_error",
+                    "item_not_found",
+                    f"Assistant item {event.item_id!r} was not found.",
+                )
+                return
+            del self.conversation[item_index]
+
+        await self.send(
+            make_event(
+                "conversation.item.truncated",
+                item_id=event.item_id,
+                content_index=event.content_index,
+                audio_end_ms=event.audio_end_ms,
+            )
+        )
+
     async def cancel_active_response(self, reason: str) -> None:
         async with self.response_state_lock:
             if self.response_start_pending:
@@ -359,27 +406,41 @@ class RealtimeSession:
             self.run_response(audio_payload)
         )
         try:
-            response_text = await self.active_response_task
+            response_output = await self.active_response_task
         except asyncio.CancelledError:
             if self.response_cancel_reason is None or self.turn_cancel_requested:
                 raise
-            response_text = ""
+            response_output = None
         finally:
             self.active_response_task = None
             self.response_cancel_reason = None
         abort_task = self.active_response_abort_task
         if abort_task is not None:
             await asyncio.shield(abort_task)
-        transcript = await self.run_transcription(item_id, audio_payload)
-        # Append in chronological order: user spoke first, assistant replied.
-        if transcript:
-            self.conversation.append(ConversationItem(role="user", text=transcript))
-        if response_text:
-            self.conversation.append(
-                ConversationItem(role="assistant", text=response_text)
-            )
+        try:
+            transcript = await self.run_transcription(item_id, audio_payload)
+            if transcript:
+                self.conversation.append(
+                    ConversationItem(role="user", text=transcript, item_id=item_id)
+                )
+            if (
+                response_output is not None
+                and response_output.text
+                and response_output.item_id not in self.truncated_assistant_item_ids
+            ):
+                self.conversation.append(
+                    ConversationItem(
+                        role="assistant",
+                        text=response_output.text,
+                        item_id=response_output.item_id,
+                    )
+                )
+        finally:
+            if response_output is not None:
+                self.pending_assistant_item_ids.discard(response_output.item_id)
+                self.truncated_assistant_item_ids.discard(response_output.item_id)
 
-    async def run_response(self, audio_payload: str) -> str:
+    async def run_response(self, audio_payload: str) -> ResponseOutput:
         """Stream the assistant response and wait for every active terminal."""
         response_request = self.build_response_request(audio_payload)
         wants_audio = "audio" in (response_request.output_modalities or [])
@@ -396,6 +457,9 @@ class RealtimeSession:
         text_done = False
         audio_done = False
         response_done = False
+        retain_for_history = False
+        if wants_audio:
+            self.pending_assistant_item_ids.add(resp_item_id)
 
         async def emit_terminals(
             *,
@@ -486,7 +550,7 @@ class RealtimeSession:
                     status="cancelled",
                     reason=reason,
                 )
-                return ""
+                return ResponseOutput(item_id=resp_item_id, text="")
 
             async for chunk in self.client.completion_stream(
                 response_request,
@@ -571,7 +635,7 @@ class RealtimeSession:
                     status="cancelled",
                     reason=self.cancelled_response_reason or "client_cancelled",
                 )
-                return ""
+                return ResponseOutput(item_id=resp_item_id, text="")
 
             if wants_audio and not saw_audio:
                 await emit_terminals_safely(
@@ -585,7 +649,7 @@ class RealtimeSession:
                         "The configured pipeline completed without audio output.",
                     ),
                 )
-                return ""
+                return ResponseOutput(item_id=resp_item_id, text="")
 
             await emit_terminals_safely(
                 response_text=response_text,
@@ -593,7 +657,8 @@ class RealtimeSession:
                 status="completed",
                 reason=finish_reason,
             )
-            return response_text
+            retain_for_history = wants_audio
+            return ResponseOutput(item_id=resp_item_id, text=response_text)
         except asyncio.CancelledError:
             if not response_done:
                 await claim_terminal()
@@ -634,8 +699,11 @@ class RealtimeSession:
                         )
                     ),
                 )
-            return ""
+            return ResponseOutput(item_id=resp_item_id, text="")
         finally:
+            if wants_audio and not retain_for_history:
+                self.pending_assistant_item_ids.discard(resp_item_id)
+                self.truncated_assistant_item_ids.discard(resp_item_id)
             if self.active_request_id == request_id:
                 self.active_request_id = None
             async with self.response_state_lock:

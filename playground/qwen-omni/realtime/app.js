@@ -57,7 +57,6 @@
   const OUTPUT_SR = 24000;
   const playback = new RealtimePlaybackController({ sampleRate: OUTPUT_SR });
   const turns = new RealtimeTurnTracker();
-  let pendingResponseInterrupted = false;
 
   // ─────────────────────  Status helpers  ─────────────────────
 
@@ -180,7 +179,6 @@
   function clearTurns() {
     playback.flush();
     turns.clear();
-    pendingResponseInterrupted = false;
     turnCards.clear();
     turnCounter = 0;
     transcriptsEl.innerHTML =
@@ -324,7 +322,6 @@
   function stopPlayback() {
     playback.close();
     turns.clear();
-    pendingResponseInterrupted = false;
   }
 
   // ─────────────────────  Oscilloscope  ─────────────────────
@@ -399,14 +396,22 @@
 
       case "input_audio_buffer.speech_started":
         if (connectionWantsAudio()) {
-          const interruptedResponseIds = playback.interrupt();
-          if (interruptedResponseIds.length) {
-            for (const responseId of interruptedResponseIds) {
-              const itemId = turns.interruptResponse(responseId);
-              markTurnInterrupted(itemId);
+          const interruptedResponses = playback.interrupt();
+          if (interruptedResponses.length) {
+            for (const record of interruptedResponses) {
+              const turnItemId = turns.interruptResponse(record.responseId);
+              markTurnInterrupted(turnItemId);
+              if (record.itemId) {
+                wsSend({
+                  type: "conversation.item.truncate",
+                  item_id: record.itemId,
+                  content_index: 0,
+                  audio_end_ms: record.audioEndMs,
+                });
+              }
             }
           } else if (turns.hasPendingResponse()) {
-            pendingResponseInterrupted = true;
+            turns.markPendingInterrupted();
           }
         }
         ensureTurn(evt.item_id);
@@ -414,7 +419,7 @@
         return;
 
       case "input_audio_buffer.speech_stopped":
-        pendingResponseInterrupted = false;
+        turns.clearPendingInterruption();
         setTurnMeta(evt.item_id, `stopped ${ms(evt.audio_end_ms)}`);
         return;
 
@@ -427,11 +432,7 @@
       // ── Pass 1: assistant reply (streams first) ──
       case "response.created": {
         const responseId = responseIdOf(evt);
-        const binding = turns.beginResponse(
-          responseId,
-          pendingResponseInterrupted,
-        );
-        pendingResponseInterrupted = false;
+        const binding = turns.beginResponse(responseId);
         if (!responseId || !binding.itemId) {
           playback.rejectResponse(responseId);
         } else if (binding.interrupted) {
@@ -472,7 +473,7 @@
           turns.ownsResponse(responseId) &&
           evt.delta
         ) {
-          playback.queueAudioDelta(evt.delta, responseId);
+          playback.queueAudioDelta(evt.delta, responseId, evt.item_id);
         }
         return;
       }
@@ -489,7 +490,11 @@
         const responseId = responseIdOf(evt);
         const responseStatus =
           (evt.response && evt.response.status) || "completed";
-        const result = turns.finishResponse(responseId);
+        const responseReason =
+          evt.response &&
+          evt.response.status_details &&
+          evt.response.status_details.reason;
+        const result = turns.finishResponse(responseId, responseReason);
         playback.finishResponse(responseId, responseStatus);
         if (result.itemId) {
           const node = turnCards.get(result.itemId);

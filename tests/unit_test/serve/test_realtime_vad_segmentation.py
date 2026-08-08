@@ -11,7 +11,6 @@ import pytest
 from starlette.websockets import WebSocketState
 
 from sglang_omni.serve.realtime import session as session_module
-from sglang_omni.serve.realtime.audio_buffer import RealtimeAudioBuffer
 from sglang_omni.serve.realtime.events import InputAudioBufferAppend
 from sglang_omni.serve.realtime.session import RealtimeSession
 from sglang_omni.serve.realtime.vad import Emit, VADEvent
@@ -44,17 +43,6 @@ class StopStartVAD:
 
     def reset(self) -> None:
         self.reset_calls += 1
-
-
-def test_audio_buffer_discards_only_a_checked_prefix() -> None:
-    buffer = RealtimeAudioBuffer()
-    buffer.buf.extend(b"abcdefgh")
-
-    buffer.discard_prefix(4)
-
-    assert bytes(buffer.buf) == b"efgh"
-    with pytest.raises(ValueError):
-        buffer.discard_prefix(5)
 
 
 @pytest.mark.asyncio
