@@ -40,6 +40,8 @@ _TRANSCRIPTION_PROMPT = (
     "— no descriptions, no refusals, no explanations."
 )
 
+_MAX_CANCELLED_ASSISTANT_ITEM_IDS = 64
+
 HANDLERS: dict[type, str] = {
     SessionUpdate: "handle_session_update",
     InputAudioBufferAppend: "handle_audio_append",
@@ -123,6 +125,7 @@ class RealtimeSession:
         self.pending_response_cancel_reason: str | None = None
         self.pending_assistant_item_ids: set[str] = set()
         self.truncated_assistant_item_ids: set[str] = set()
+        self.cancelled_assistant_item_ids: dict[str, None] = {}
         self.speech_idle = asyncio.Event()
         self.speech_idle.set()
         # VAD may emit speech_stopped while engine is still busy on an
@@ -302,6 +305,12 @@ class RealtimeSession:
     async def handle_response_cancel(self, event: ResponseCancel) -> None:
         await self.cancel_active_response("client_cancelled")
 
+    def _remember_cancelled_assistant_item(self, item_id: str) -> None:
+        self.cancelled_assistant_item_ids[item_id] = None
+        if len(self.cancelled_assistant_item_ids) > _MAX_CANCELLED_ASSISTANT_ITEM_IDS:
+            oldest_item_id = next(iter(self.cancelled_assistant_item_ids))
+            del self.cancelled_assistant_item_ids[oldest_item_id]
+
     async def handle_conversation_item_truncate(
         self, event: ConversationItemTruncate
     ) -> None:
@@ -315,7 +324,7 @@ class RealtimeSession:
 
         if event.item_id in self.pending_assistant_item_ids:
             self.truncated_assistant_item_ids.add(event.item_id)
-        else:
+        elif event.item_id not in self.cancelled_assistant_item_ids:
             item_index = next(
                 (
                     index
@@ -508,6 +517,8 @@ class RealtimeSession:
                 reason=reason,
                 usage=usage,
             )
+            if wants_audio and status == "cancelled":
+                self._remember_cancelled_assistant_item(resp_item_id)
             response_done = True
 
         async def emit_terminals_safely(**kwargs: Any) -> None:

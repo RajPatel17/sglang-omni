@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from sglang_omni.client.types import CompletionStreamChunk
+from sglang_omni.serve.realtime.vad import Emit, VADEvent
 from tests.unit_test.serve.test_realtime_barge_in import _chunk, _session
 
 
@@ -23,6 +24,19 @@ def _response_stream() -> AsyncIterator[CompletionStreamChunk]:
         yield _chunk(modality="audio", finish_reason="stop")
 
     return response()
+
+
+def test_cancelled_assistant_item_tombstones_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, _, _ = _session(monkeypatch, [])
+
+    for index in range(65):
+        session._remember_cancelled_assistant_item(f"assistant-{index}")
+
+    assert list(session.cancelled_assistant_item_ids) == [
+        f"assistant-{index}" for index in range(1, 65)
+    ]
 
 
 @pytest.mark.asyncio
@@ -87,6 +101,56 @@ async def test_truncate_after_history_append_removes_recorded_assistant(
         }
     )
 
+    assert [(item.role, item.text) for item in session.conversation] == [
+        ("user", "question")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_truncate_after_cancelled_response_is_acknowledged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late truncate is a no-op after cancellation already omitted the item."""
+    response_started = asyncio.Event()
+    transcription_started = asyncio.Event()
+    release_transcription = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        response_started.set()
+        yield _chunk(text="partial assistant answer")
+        yield _chunk(modality="audio")
+        await asyncio.Event().wait()
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        transcription_started.set()
+        await release_transcription.wait()
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    session, websocket, _ = _session(monkeypatch, [response, transcription])
+    turn = asyncio.create_task(session.run_turn("user-item", "audio"))
+    await response_started.wait()
+    await session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    await transcription_started.wait()
+
+    assistant_item_id = _assistant_item_id(websocket.events)
+    event_count = len(websocket.events)
+    await session.dispatch(
+        {
+            "type": "conversation.item.truncate",
+            "item_id": assistant_item_id,
+            "content_index": 0,
+            "audio_end_ms": 10,
+        }
+    )
+    truncate_events = websocket.events[event_count:]
+
+    release_transcription.set()
+    await turn
+
+    assert [event["type"] for event in truncate_events] == [
+        "conversation.item.truncated"
+    ]
     assert [(item.role, item.text) for item in session.conversation] == [
         ("user", "question")
     ]
