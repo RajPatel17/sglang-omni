@@ -2,10 +2,10 @@
  * WIRE SERVICE — sglang-omni /v1/realtime
  *
  * Captures mic → 16 kHz mono PCM16 via AudioWorklet → base64-encodes →
- * sends `input_audio_buffer.append`. Server VAD is always on; auto-commit
- * fires on speech_stopped. Text-only mode renders the assistant reply and
- * user transcript. Text + audio mode renders the assistant reply and queues
- * its 24 kHz PCM16 audio for gapless playback.
+ * sends `input_audio_buffer.append`. Server-side turn detection auto-commits
+ * on speech_stopped. Text-only mode renders the assistant reply and user
+ * transcript. Text + audio mode renders the assistant reply and queues its
+ * 24 kHz PCM16 audio for gapless playback.
  *
  * Vanilla — no framework, no build step, no error handling. Per house
  * style: if something fails, the browser console gets the exception.
@@ -19,6 +19,8 @@
   // ─────────────────────  DOM refs  ─────────────────────
   const wsUrlEl       = $("ws-url");
   const outputModeEl  = $("output-mode");
+  const turnDetectionEl = $("turn-detection");
+  const eagernessEl   = $("eagerness");
   const instructionsEl = $("instructions");
   const connectBtn    = $("connect");
   const disconnectBtn = $("disconnect");
@@ -51,6 +53,7 @@
   let nextPlaybackTime = 0;
   let activeModalities = null;
   let sessionReady = false;
+  let semanticVadSupported = false;
   let turnCounter = 0;
   // Each turn card is keyed by the audio item_id minted at speech_started /
   // committed.
@@ -105,14 +108,20 @@
     return wantsAudioOutput() ? ["text", "audio"] : ["text"];
   }
 
+  function selectedTurnDetection() {
+    if (turnDetectionEl.value === "semantic_vad" && semanticVadSupported) {
+      return { type: "semantic_vad", eagerness: eagernessEl.value };
+    }
+    return { type: "server_vad" };
+  }
+
   function sendSessionUpdate(modalities = activeModalities || selectedModalities()) {
-    // turn_detection is fixed server-side (always server_vad with defaults);
-    // output modalities follow the mode selected before opening the wire.
     const wantsAudio = modalities.includes("audio");
     const session = {
       modalities,
       input_audio_format: "pcm16",
       instructions: instructionsEl.value,
+      turn_detection: selectedTurnDetection(),
     };
     if (wantsAudio) {
       session.output_audio_format = "pcm16";
@@ -132,16 +141,17 @@
       ensurePlaybackContext();
     }
     outputModeEl.disabled = true;
+    turnDetectionEl.disabled = true;
+    eagernessEl.disabled = true;
     ws = new WebSocket(url);
     setStatus("Opening line…");
 
     ws.onopen = () => {
-      setStatus("Negotiating output mode…");
+      setStatus("Waiting for server capabilities…");
       setLive(true);
       connectBtn.disabled = true;
       disconnectBtn.disabled = false;
       micStartBtn.disabled = true;
-      sendSessionUpdate(activeModalities);
     };
 
     ws.onmessage = (ev) => {
@@ -154,6 +164,8 @@
       connectBtn.disabled = false;
       disconnectBtn.disabled = true;
       outputModeEl.disabled = false;
+      turnDetectionEl.disabled = false;
+      eagernessEl.disabled = turnDetectionEl.value !== "semantic_vad";
       micStartBtn.disabled = true;
       micStopBtn.disabled = true;
       clearBufferBtn.disabled = true;
@@ -401,9 +413,22 @@
 
   function handleServerEvent(evt) {
     switch (evt.type) {
-      case "session.created":
-        setStatus("Negotiating output mode…");
+      case "session.created": {
+        const supported =
+          evt.session &&
+          evt.session.capabilities &&
+          evt.session.capabilities.turn_detection;
+        semanticVadSupported =
+          Array.isArray(supported) && supported.includes("semantic_vad");
+        if (turnDetectionEl.value === "semantic_vad" && !semanticVadSupported) {
+          turnDetectionEl.value = "server_vad";
+        }
+        eagernessEl.disabled = true;
+        updatePresentation(false);
+        setStatus("Negotiating session…");
+        sendSessionUpdate(activeModalities);
         return;
+      }
 
       case "session.updated":
         if (
@@ -414,11 +439,19 @@
           if (ws) ws.close();
           return;
         }
+        if (
+          turnDetectionEl.value === "semantic_vad" &&
+          (!evt.session.turn_detection ||
+            evt.session.turn_detection.type !== "semantic_vad")
+        ) {
+          turnDetectionEl.value = "server_vad";
+          updatePresentation(false);
+        }
         sessionReady = true;
         micStartBtn.disabled = false;
         setStatus(
           `${connectionWantsAudio() ? "Text + audio" : "Text only"} · ` +
-            `session ${evt.session.id.slice(0, 12)}…`,
+            `${turnDetectionEl.value} · session ${evt.session.id.slice(0, 12)}…`,
           "connected",
         );
         return;
@@ -603,12 +636,16 @@
 
   // ─────────────────────  Misc UI  ─────────────────────
 
-  function updatePresentation() {
+  function updatePresentation(resetTurns = true) {
+    const turnDetectionText =
+      turnDetectionEl.value === "semantic_vad"
+        ? "Smart Turn detects when your thought is complete"
+        : "Fixed-silence VAD detects when you stop";
     if (wantsAudioOutput()) {
       mastheadModeEl.textContent = "LIVE AUDIO RESPONSES";
       mastheadTaglineEl.textContent =
         "A demonstration of /v1/realtime — voice in, streamed text and voice " +
-        "out. Server VAD detects when you stop; the engine streams its spoken answer.";
+        `out. ${turnDetectionText}; the engine streams its spoken answer.`;
       transcriptsLabelEl.textContent = "Assistant Responses";
       transcriptsTaglineEl.textContent =
         "Each response is set in Newsreader Italic, lifted from the wire as " +
@@ -617,20 +654,26 @@
       mastheadModeEl.textContent = "A LIVE TRANSCRIPT";
       mastheadTaglineEl.textContent =
         "A demonstration of /v1/realtime — voice in, text out. " +
-        "Server VAD detects when you stop; the engine answers, then " +
+        `${turnDetectionText}; the engine answers, then ` +
         "transcribes what you said.";
       transcriptsLabelEl.textContent = "The Transcript";
       transcriptsTaglineEl.textContent =
         "Each turn shows the assistant reply followed by the verbatim " +
         "transcript of what you said.";
     }
-    clearTurns();
+    if (resetTurns) clearTurns();
   }
 
   outputModeEl.addEventListener("change", () => {
     stopPlayback();
     updatePresentation();
   });
+  turnDetectionEl.addEventListener("change", () => {
+    eagernessEl.disabled = turnDetectionEl.value !== "semantic_vad";
+    updatePresentation();
+  });
+  eagernessEl.addEventListener("change", () => updatePresentation());
   instructionsEl.addEventListener("change", () => sendSessionUpdate());
+  eagernessEl.disabled = turnDetectionEl.value !== "semantic_vad";
   updatePresentation();
 })();

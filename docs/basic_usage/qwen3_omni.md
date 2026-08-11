@@ -275,7 +275,7 @@ runtime_overrides:
       max_running_requests: 16
 ```
 
-### Realtime Speech with Server VAD
+### Realtime Speech with Server-Side Turn Detection
 
 The speech pipeline can stream spoken responses over `/v1/realtime`. Enable the
 WebSocket endpoint on the standard speech pipeline:
@@ -296,15 +296,46 @@ output:
   "session": {
     "modalities": ["text", "audio"],
     "input_audio_format": "pcm16",
-    "output_audio_format": "pcm16"
+    "output_audio_format": "pcm16",
+    "turn_detection": {
+      "type": "semantic_vad",
+      "eagerness": "medium"
+    }
   }
 }
 ```
 
-Stream mono 16 kHz PCM16 input with `input_audio_buffer.append`. Server VAD
-automatically commits each utterance and starts generation. Text arrives in
-`response.text.delta` events; spoken output arrives as base64-encoded mono
-24 kHz PCM16 in `response.audio.delta` events, followed by
+Stream mono 16 kHz PCM16 input with `input_audio_buffer.append`. Server-side
+turn detection automatically commits each utterance and starts generation.
+Clients should wait for `session.created.capabilities.turn_detection` and
+request `semantic_vad` only when the connected server advertises it.
+
+When omitted, `turn_detection` remains the existing fixed-silence
+`server_vad`. `semantic_vad` combines Silero speech detection with the CPU
+Smart Turn v3.2 end-of-utterance model so a short pause can remain part of an
+incomplete thought. `eagerness` accepts `low`, `medium`, or `high` and defaults
+to `medium`. `silence_duration_ms` applies only to `server_vad`; semantic VAD
+uses the eagerness preset's pause windows.
+
+The detector scores semantic completion once after 160 ms. With medium
+eagerness, confidence at or above 0.97 commits after 250 ms of total silence,
+confidence at or above 0.88 commits after 640 ms, and lower confidence waits
+for the 2-second hard stop. Resumed speech discards the pause decision and the
+expanded utterance is scored at the next pause. Low and high eagerness use hard
+stops of 3.0 and 1.2 seconds respectively.
+
+Provision the BSD-2 licensed
+[Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3)
+`smart-turn-v3.2-cpu.onnx` model before startup and set
+`SGLANG_OMNI_SMART_TURN_MODEL_PATH` to the model file or its containing
+directory. The runtime does not download model weights and verifies SHA-256
+`2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f`.
+Realtime startup loads one shared CPU ONNX instance. If the model is missing
+or invalid, the endpoint stays available and semantic requests report
+`server_vad` as their effective turn detector.
+
+Text arrives in `response.text.delta` events; spoken output arrives as
+base64-encoded mono 24 kHz PCM16 in `response.audio.delta` events, followed by
 `response.audio.done` and `response.done`.
 
 Audio output is opt-in: sessions remain text-only unless both modalities are
@@ -312,8 +343,8 @@ requested. A thinker-only server rejects audio negotiation because it has no
 `code2wav` stage.
 
 The browser example in `playground/qwen-omni/realtime` captures microphone
-input and lets the user select text-only output or text plus streamed PCM16
-audio playback.
+input, negotiates turn-detection support per connection, and lets the user
+select text-only output or text plus streamed PCM16 audio playback.
 
 ## Single-GPU FP8 on H100/H20
 

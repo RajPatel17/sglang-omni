@@ -5,7 +5,7 @@ import dataclasses
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
@@ -18,9 +18,13 @@ from sglang_omni.serve.realtime.events import (
     ResponseCancel,
     SessionObject,
     SessionUpdate,
+    TurnDetection,
+    TurnDetectionType,
     make_event,
     parse_client_event,
 )
+from sglang_omni.serve.realtime.semantic_vad import SemanticEOUModel
+from sglang_omni.serve.realtime.turn_detector import TurnDetector, build_turn_detector
 from sglang_omni.serve.realtime.vad import (
     StreamingVAD,
     VADConfig,
@@ -45,6 +49,8 @@ HANDLERS: dict[type, str] = {
     InputAudioBufferClear: "handle_audio_clear",
     ResponseCancel: "handle_response_cancel",
 }
+
+_UNSET = object()
 
 
 def new_id(prefix: str) -> str:
@@ -78,16 +84,24 @@ class RealtimeSession:
         model_name: str,
         session_id: str | None = None,
         supports_audio_output: bool = False,
+        smart_turn_model: SemanticEOUModel | None = None,
     ) -> None:
         self.websocket = websocket
         self.client = client
         self.model_name = model_name
         self.session_id = session_id or new_id("sess")
         self.supports_audio_output = supports_audio_output
+        self.smart_turn_model = smart_turn_model
 
         self.session_object = SessionObject(
             id=self.session_id,
             model=model_name,
+            capabilities={
+                "turn_detection": [
+                    TurnDetectionType.SERVER_VAD.value,
+                    TurnDetectionType.SEMANTIC_VAD.value,
+                ]
+            },
             modalities=["text"],
             instructions=DEFAULT_INSTRUCTIONS,
             input_audio_format="pcm16",
@@ -108,9 +122,7 @@ class RealtimeSession:
         self.response_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.queue_drainer: asyncio.Task | None = None
 
-        # VAD is created once with default config; session.update doesn't
-        # touch it. Reconnect to change VAD params.
-        self.vad = StreamingVAD(VADConfig())
+        self.vad: TurnDetector = StreamingVAD(VADConfig())
         self.vad_origin_samples = 0
         self.buffer_origin_samples = 0
         self.utterance_start_byte: int | None = None
@@ -144,10 +156,29 @@ class RealtimeSession:
 
     async def handle_session_update(self, event: SessionUpdate) -> None:
         # Validate a candidate first so a rejected update never lands in live state.
-        update = event.session.model_dump(exclude_none=True, exclude_unset=True)
-        candidate = SessionObject.model_validate(
-            self.session_object.model_dump() | update
+        update = event.session.model_dump(
+            exclude_none=True,
+            exclude_unset=True,
+            mode="json",
         )
+        update.pop("capabilities", None)
+        current = self.session_object.model_dump(mode="json")
+        turn_detection_update = update.pop("turn_detection", _UNSET)
+        try:
+            if turn_detection_update is not _UNSET:
+                current["turn_detection"] = self._merge_turn_detection(
+                    current.get("turn_detection"),
+                    turn_detection_update,
+                )
+            candidate = SessionObject.model_validate(current | update)
+        except ValueError as exc:
+            await self.send_error(
+                "invalid_request_error",
+                "invalid_turn_detection",
+                str(exc),
+            )
+            return
+
         modalities = set(candidate.modalities)
         if modalities not in ({"text"}, {"text", "audio"}):
             await self.send_error(
@@ -172,13 +203,99 @@ class RealtimeSession:
                 "Only PCM16 output audio is supported.",
             )
             return
+
+        replacement_vad: TurnDetector | None = None
+        turn_detection_changed = (
+            turn_detection_update is not _UNSET
+            and self._detector_config(candidate.turn_detection)
+            != self._detector_config(self.session_object.turn_detection)
+        )
+        if turn_detection_changed:
+            try:
+                build = await asyncio.to_thread(
+                    build_turn_detector,
+                    self._detector_config(candidate.turn_detection),
+                    self.smart_turn_model,
+                )
+                candidate.turn_detection = TurnDetection.model_validate(
+                    build.effective_config
+                )
+                if self._detector_config(
+                    candidate.turn_detection
+                ) != self._detector_config(self.session_object.turn_detection):
+                    replacement_vad = build.detector
+            except ValueError as exc:
+                await self.send_error(
+                    "invalid_request_error",
+                    "invalid_turn_detection",
+                    str(exc),
+                )
+                return
+            except Exception as exc:
+                asyncio.get_running_loop().call_exception_handler(
+                    {
+                        "message": "Realtime turn detector initialization failed",
+                        "exception": exc,
+                    }
+                )
+                await self.send_error(
+                    "server_error",
+                    "turn_detection_initialization_failed",
+                    "The requested turn detector could not be initialized.",
+                )
+                return
+
+        had_pending_audio = (
+            not self.audio_buffer.is_empty() or self.utterance_item_id is not None
+        )
+        if replacement_vad is not None:
+            self.drop_buffer_and_reset_vad()
+            self.vad = replacement_vad
         self.session_object = candidate
+        if replacement_vad is not None and had_pending_audio:
+            await self.send(make_event("input_audio_buffer.cleared"))
         await self.send(
             make_event(
                 "session.updated",
                 session=self.session_object.model_dump(exclude_none=True),
             )
         )
+
+    @staticmethod
+    def _detector_config(value: TurnDetection | None) -> dict[str, Any]:
+        effective = value or TurnDetection()
+        return effective.model_dump(exclude_none=True, mode="json")
+
+    @staticmethod
+    def _merge_turn_detection(
+        current: Mapping[str, Any] | None,
+        update: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if update is None:
+            return dict(current) if current is not None else None
+        current_data = dict(current or {})
+        update_data = dict(update)
+        current_type = str(
+            current_data.get("type") or TurnDetectionType.SERVER_VAD.value
+        )
+        requested_type = str(update_data.get("type") or current_type)
+        if requested_type == current_type:
+            merged = {**current_data, **update_data}
+        else:
+            merged = update_data
+        if (
+            requested_type == TurnDetectionType.SEMANTIC_VAD.value
+            and merged.get("silence_duration_ms") is not None
+        ):
+            raise ValueError(
+                "silence_duration_ms is only supported for server_vad; "
+                "use semantic_vad eagerness instead"
+            )
+        if requested_type == TurnDetectionType.SEMANTIC_VAD.value:
+            merged["type"] = requested_type
+            merged["eagerness"] = merged.get("eagerness") or "medium"
+            merged.pop("silence_duration_ms", None)
+        return merged
 
     async def handle_audio_append(self, event: InputAudioBufferAppend) -> None:
         decoded_len = self.audio_buffer.append_b64(event.audio)

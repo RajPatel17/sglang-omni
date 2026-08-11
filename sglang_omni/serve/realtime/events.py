@@ -26,11 +26,18 @@ class TurnDetectionType(str, Enum):
     SEMANTIC_VAD = "semantic_vad"
 
 
+class SemanticVADEagerness(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 class TurnDetection(EventBase):
     type: TurnDetectionType = TurnDetectionType.SERVER_VAD
     threshold: float | None = None
     prefix_padding_ms: int | None = None
     silence_duration_ms: int | None = None
+    eagerness: SemanticVADEagerness | None = None
 
 
 class SessionConfig(EventBase):
@@ -49,6 +56,7 @@ class SessionObject(EventBase):
     id: str
     object: Literal["realtime.session"] = "realtime.session"
     model: str
+    capabilities: dict[str, Any] = Field(default_factory=dict)
     modalities: list[str] = Field(default_factory=lambda: ["text"])
     instructions: str = ""
     input_audio_format: str = "pcm16"
