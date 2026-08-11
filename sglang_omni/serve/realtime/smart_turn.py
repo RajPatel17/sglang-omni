@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,11 +47,18 @@ class SmartTurnEOU(SemanticEOUModel):
         features = self.feature_extractor(
             audio,
             sampling_rate=sample_rate,
-            return_attention_mask=True,
             return_tensors="np",
-        ).input_features.astype(np.float32, copy=False)
-        output = self.session.run(None, {"input_features": features})[0]
-        return float(np.clip(np.asarray(output).reshape(-1)[0], 0.0, 1.0))
+            padding="max_length",
+            max_length=max_samples,
+            truncation=True,
+            do_normalize=True,
+        ).input_features
+        input_features = features.squeeze(0).astype(np.float32, copy=False)[None, ...]
+        output = self.session.run(None, {"input_features": input_features})[0]
+        probability = float(np.asarray(output).reshape(-1)[0])
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError(f"Smart Turn returned invalid probability: {probability}")
+        return probability
 
 
 def load_smart_turn() -> SmartTurnEOU | None:
@@ -88,9 +96,13 @@ def _load_model(model_path: Path) -> Any:
     options = ort.SessionOptions()
     options.inter_op_num_threads = 1
     options.intra_op_num_threads = 1
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    return ort.InferenceSession(
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    session = ort.InferenceSession(
         str(model_path),
         sess_options=options,
         providers=["CPUExecutionProvider"],
     )
+    inputs = session.get_inputs()
+    if len(inputs) != 1 or inputs[0].name != "input_features":
+        raise RuntimeError("Unexpected Smart Turn ONNX input contract")
+    return session

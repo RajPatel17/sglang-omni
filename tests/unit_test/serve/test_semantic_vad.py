@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -14,6 +14,7 @@ from sglang_omni.serve.realtime.semantic_vad import (
 from sglang_omni.serve.realtime.smart_turn import (
     SMART_TURN_MODEL_ENV,
     SMART_TURN_MODEL_SHA256,
+    SmartTurnEOU,
     load_smart_turn,
 )
 from sglang_omni.serve.realtime.turn_detector import build_turn_detector
@@ -147,6 +148,43 @@ def test_detector_factory_normalizes_missing_semantic_model():
     assert build.detector is fake_server
     assert build.effective_config["type"] == "server_vad"
     assert build.effective_config["eagerness"] is None
+
+
+def test_semantic_factory_applies_silero_options():
+    fake_detector = object()
+    with patch(
+        "sglang_omni.serve.realtime.turn_detector.SemanticTurnDetector",
+        return_value=fake_detector,
+    ) as detector_type:
+        build = build_turn_detector(
+            {
+                "type": "semantic_vad",
+                "eagerness": "high",
+                "threshold": 0.7,
+                "prefix_padding_ms": 120,
+            },
+            smart_turn_model=FakeEOU([0.9]),
+        )
+
+    config = detector_type.call_args.args[1]
+    assert build.detector is fake_detector
+    assert config.speech_threshold == 0.7
+    assert config.prefix_padding_ms == 120
+
+
+def test_smart_turn_uses_normalized_whisper_features():
+    feature_extractor = MagicMock()
+    features = np.zeros((1, 80, 800), dtype=np.float32)
+    feature_extractor.return_value.input_features = features
+    session = MagicMock()
+    session.run.return_value = [np.array([0.9], dtype=np.float32)]
+    model = SmartTurnEOU(session=session, feature_extractor=feature_extractor)
+
+    assert model.predict(np.ones(16000, dtype=np.float32), 16000) == pytest.approx(0.9)
+    assert feature_extractor.call_args.kwargs["do_normalize"] is True
+    with patch.object(session, "run", return_value=[np.array([1.1])]):
+        with pytest.raises(ValueError, match="invalid probability"):
+            model.predict(np.ones(16000, dtype=np.float32), 16000)
 
 
 def test_smart_turn_loader_is_local_and_checksum_pinned(tmp_path, monkeypatch):

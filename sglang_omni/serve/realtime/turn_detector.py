@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol
 
 from .semantic_vad import SemanticEOUModel, SemanticTurnDetector, SemanticVADConfig
@@ -29,9 +29,19 @@ def build_turn_detector(
     requested_type = str(getattr(raw_type, "value", raw_type) or "server_vad")
     if requested_type == "semantic_vad" and smart_turn_model is not None:
         eagerness = str(config.get("eagerness") or "medium")
+        semantic_config = replace(
+            SemanticVADConfig.from_eagerness(eagerness),
+            speech_threshold=_optional_float(
+                config.get("threshold"), SemanticVADConfig.speech_threshold
+            ),
+            prefix_padding_ms=_optional_int(
+                config.get("prefix_padding_ms"),
+                SemanticVADConfig.prefix_padding_ms,
+            ),
+        )
         detector = SemanticTurnDetector(
             smart_turn_model,
-            SemanticVADConfig.from_eagerness(eagerness),
+            semantic_config,
         )
         effective = dict(config)
         effective["type"] = "semantic_vad"
