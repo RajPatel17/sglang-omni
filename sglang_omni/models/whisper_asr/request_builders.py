@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Callable
 
 import torch
@@ -17,11 +18,19 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import GenerationConfig
 
+from sglang_omni.models.whisper_asr.config import WHISPER_MAX_INPUT_SECONDS
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 _WHISPER_SAMPLE_RATE = 16000
+
+_MAX_ENGINE_CLIP_S = float(WHISPER_MAX_INPUT_SECONDS)
+_MAX_ENGINE_CLIP_MESSAGE = (
+    f"Whisper ASR accepts audio up to {WHISPER_MAX_INPUT_SECONDS} seconds per "
+    "request (the model's mel window); send longer audio through "
+    "/v1/audio/transcriptions, which splits it into chunks"
+)
 # note (jiannan-17): Previous context = 1 start-of-prev token + up to 223 prompt tokens.
 MAX_PREV_CONTEXT_TOKENS = 224
 # note (jiannan-17): Standard Whisper decoder context is 448 positions.
@@ -114,6 +123,9 @@ def make_whisper_scheduler_adapters(
     Callable[[StagePayload], WhisperASRRequestData], Callable[[Any], StagePayload]
 ]:
     logit_bias = _build_logit_bias(generation_config)
+    # note (Dayuxiaoshui): set_prefix_tokens mutates shared tokenizer state
+    # across request-build workers.
+    tokenizer_lock = Lock()
     eos_token_id = int(tokenizer.eos_token_id)
     pad_token_id = int(tokenizer.pad_token_id or eos_token_id)
     vocab_size = int(tokenizer.vocab_size)
@@ -128,7 +140,11 @@ def make_whisper_scheduler_adapters(
     def request_builder(payload: StagePayload) -> WhisperASRRequestData:
         params = payload.request.params or {}
         prepared = prepare_audio(
-            payload, source_name="Whisper ASR", target_sample_rate=_WHISPER_SAMPLE_RATE
+            payload,
+            source_name="Whisper ASR",
+            target_sample_rate=_WHISPER_SAMPLE_RATE,
+            max_duration_s=_MAX_ENGINE_CLIP_S,
+            max_duration_message=_MAX_ENGINE_CLIP_MESSAGE,
         )
         audio = prepared.waveform
         audio_duration_s = prepared.duration_s
@@ -136,21 +152,22 @@ def make_whisper_scheduler_adapters(
 
         language = _resolve_language(params.get("language"))
         task = str(params.get("task") or "transcribe")
-        prefix_token_ids = _build_prefix_tokens(
-            tokenizer,
-            language=language,
-            task=task,
-        )
-        request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
-            decoder_context_len=decoder_context_len,
-            prefix_len=len(prefix_token_ids),
-            requested_max_new_tokens=int(
-                params.get("max_new_tokens") or max_new_tokens
-            ),
-        )
-        prev_context_ids = _build_prev_context_tokens(
-            tokenizer, params.get("prompt"), max_prev_tokens=max_prev_tokens
-        )
+        with tokenizer_lock:
+            prefix_token_ids = _build_prefix_tokens(
+                tokenizer,
+                language=language,
+                task=task,
+            )
+            request_max_new_tokens, max_prev_tokens = _decoder_token_budgets(
+                decoder_context_len=decoder_context_len,
+                prefix_len=len(prefix_token_ids),
+                requested_max_new_tokens=int(
+                    params.get("max_new_tokens") or max_new_tokens
+                ),
+            )
+            prev_context_ids = _build_prev_context_tokens(
+                tokenizer, params.get("prompt"), max_prev_tokens=max_prev_tokens
+            )
         prompt_token_ids = prev_context_ids + prefix_token_ids
         # note (jiannan-17): Keep the invariant at the assembly boundary so future
         # changes fail before an out-of-range decoder position reaches the GPU.
