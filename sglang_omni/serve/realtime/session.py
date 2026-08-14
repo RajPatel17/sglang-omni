@@ -118,12 +118,13 @@ class RealtimeSession:
         self.turn_cancel_requested = False
         self.cancelled_response_request_id: str | None = None
         self.cancelled_response_reason: str | None = None
+        self.cancelled_response_terminal_gate: asyncio.Event | None = None
         self.finalized_response_request_id: str | None = None
         self.response_state_lock = asyncio.Lock()
         self.active_response_abort_task: asyncio.Task | None = None
-        self.pending_barge_in_event: asyncio.Event | None = None
         self.response_start_pending = False
         self.pending_response_cancel_reason: str | None = None
+        self.pending_response_terminal_gate: asyncio.Event | None = None
         self.pending_assistant_item_ids: set[str] = set()
         self.truncated_assistant_item_ids: set[str] = set()
         self.cancelled_assistant_item_ids: dict[str, None] = {}
@@ -243,8 +244,9 @@ class RealtimeSession:
             barge_in_event = None
             if response_has_audio and interrupt_response:
                 barge_in_event = asyncio.Event()
-                self.pending_barge_in_event = barge_in_event
-                await self.cancel_active_response("turn_detected")
+                await self.cancel_active_response(
+                    "turn_detected", terminal_gate=barge_in_event
+                )
             try:
                 await self.send(
                     make_event(
@@ -256,8 +258,6 @@ class RealtimeSession:
             finally:
                 if barge_in_event is not None:
                     barge_in_event.set()
-                    if self.pending_barge_in_event is barge_in_event:
-                        self.pending_barge_in_event = None
         elif emit.event_type == VADEvent.SPEECH_STOPPED:
             await self.send(
                 make_event(
@@ -361,11 +361,14 @@ class RealtimeSession:
             )
         )
 
-    async def cancel_active_response(self, reason: str) -> None:
+    async def cancel_active_response(
+        self, reason: str, *, terminal_gate: asyncio.Event | None = None
+    ) -> None:
         async with self.response_state_lock:
             if self.response_start_pending:
                 if self.pending_response_cancel_reason is None:
                     self.pending_response_cancel_reason = reason
+                    self.pending_response_terminal_gate = terminal_gate
                 return
             request_id = self.active_response_request_id
             if (
@@ -378,6 +381,7 @@ class RealtimeSession:
             # the abort propagates through the pipeline.
             self.cancelled_response_request_id = request_id
             self.cancelled_response_reason = reason
+            self.cancelled_response_terminal_gate = terminal_gate
             self.response_cancel_reason = reason
             response_task = self.active_response_task
 
@@ -417,6 +421,7 @@ class RealtimeSession:
                 self.active_task = None
                 self.response_start_pending = False
                 self.pending_response_cancel_reason = None
+                self.pending_response_terminal_gate = None
 
     async def run_turn(self, item_id: str, audio_payload: str) -> None:
         """Pass 1: response (user-facing, streams fast).
@@ -532,12 +537,16 @@ class RealtimeSession:
             response_done = True
 
         async def emit_terminals_safely(**kwargs: Any) -> None:
-            barge_in_event = self.pending_barge_in_event
+            terminal_gate = (
+                self.cancelled_response_terminal_gate
+                if self.cancelled_response_request_id == request_id
+                else None
+            )
             if (
                 kwargs.get("reason") == "turn_detected"
-                and barge_in_event is not None
+                and terminal_gate is not None
             ):
-                await barge_in_event.wait()
+                await terminal_gate.wait()
             terminal_task = asyncio.create_task(emit_terminals(**kwargs))
             try:
                 await asyncio.shield(terminal_task)
@@ -567,10 +576,13 @@ class RealtimeSession:
             async with self.response_state_lock:
                 self.response_start_pending = False
                 reason = self.pending_response_cancel_reason
+                terminal_gate = self.pending_response_terminal_gate
                 self.pending_response_cancel_reason = None
+                self.pending_response_terminal_gate = None
                 if reason is not None:
                     self.cancelled_response_request_id = request_id
                     self.cancelled_response_reason = reason
+                    self.cancelled_response_terminal_gate = terminal_gate
             if reason is not None:
                 await claim_terminal()
                 await emit_terminals_safely(
@@ -742,6 +754,7 @@ class RealtimeSession:
                 if self.cancelled_response_request_id == request_id:
                     self.cancelled_response_request_id = None
                     self.cancelled_response_reason = None
+                    self.cancelled_response_terminal_gate = None
                 if self.finalized_response_request_id == request_id:
                     self.finalized_response_request_id = None
 

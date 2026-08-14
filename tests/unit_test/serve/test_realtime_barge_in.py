@@ -51,6 +51,31 @@ class BlockingSpeechStartedWebSocket(RecordingWebSocket):
         self.events.append(event)
 
 
+class FailingSpeechStartedWebSocket(RecordingWebSocket):
+    async def send_text(self, payload: str) -> None:
+        event = json.loads(payload)
+        if event["type"] == "input_audio_buffer.speech_started":
+            raise RuntimeError("speech_started send failed")
+        self.events.append(event)
+
+
+class BlockingSecondSpeechStartedWebSocket(RecordingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.speech_started_count = 0
+        self.second_speech_started_send = asyncio.Event()
+        self.release_second_speech_started = asyncio.Event()
+
+    async def send_text(self, payload: str) -> None:
+        event = json.loads(payload)
+        if event["type"] == "input_audio_buffer.speech_started":
+            self.speech_started_count += 1
+            if self.speech_started_count == 2:
+                self.second_speech_started_send.set()
+                await self.release_second_speech_started.wait()
+        self.events.append(event)
+
+
 StreamFactory = Callable[[], AsyncIterator[CompletionStreamChunk]]
 
 
@@ -214,6 +239,130 @@ async def test_barge_in_aborts_before_speech_started_send_completes(
     assert types.index("input_audio_buffer.speech_started") < types.index(
         "response.done"
     )
+
+
+@pytest.mark.asyncio
+async def test_speech_started_send_failure_does_not_deadlock_cancelled_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "StreamingVAD", FakeVAD)
+    response_started = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        response_started.set()
+        yield _chunk(text="partial")
+        yield _chunk(modality="audio")
+        await asyncio.Event().wait()
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    websocket = FailingSpeechStartedWebSocket()
+    client = ScriptedClient([response, transcription])
+    session = RealtimeSession(
+        websocket,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        model_name="qwen3-omni",
+        supports_audio_output=True,
+    )
+    session.session_object.modalities = ["text", "audio"]
+    turn = asyncio.create_task(session.run_turn("item-user", "audio"))
+    await response_started.wait()
+
+    with pytest.raises(RuntimeError, match="speech_started send failed"):
+        await session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+
+    await asyncio.wait_for(turn, 1)
+    response = next(
+        event["response"]
+        for event in websocket.events
+        if event["type"] == "response.done"
+    )
+    assert response["status_details"]["reason"] == "turn_detected"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_speech_started_handler_releases_terminal_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "StreamingVAD", FakeVAD)
+    response_started = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        response_started.set()
+        yield _chunk(text="partial")
+        yield _chunk(modality="audio")
+        await asyncio.Event().wait()
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    websocket = BlockingSpeechStartedWebSocket()
+    client = ScriptedClient([response, transcription])
+    session = RealtimeSession(
+        websocket,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        model_name="qwen3-omni",
+        supports_audio_output=True,
+    )
+    session.session_object.modalities = ["text", "audio"]
+    turn = asyncio.create_task(session.run_turn("item-user", "audio"))
+    await response_started.wait()
+    speech_started = asyncio.create_task(
+        session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    )
+    await websocket.speech_started_send.wait()
+
+    speech_started.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await speech_started
+
+    await asyncio.wait_for(turn, 1)
+    response = next(
+        event["response"]
+        for event in websocket.events
+        if event["type"] == "response.done"
+    )
+    assert response["status_details"]["reason"] == "turn_detected"
+
+
+@pytest.mark.asyncio
+async def test_repeated_pending_barge_in_keeps_first_terminal_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "StreamingVAD", FakeVAD)
+    websocket = BlockingSecondSpeechStartedWebSocket()
+    client = ScriptedClient([])
+    session = RealtimeSession(
+        websocket,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        model_name="qwen3-omni",
+        supports_audio_output=True,
+    )
+    session.session_object.modalities = ["text", "audio"]
+    session.response_start_pending = True
+
+    await session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    second_speech_started = asyncio.create_task(
+        session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 1))
+    )
+    await websocket.second_speech_started_send.wait()
+
+    response_output = await asyncio.wait_for(session.run_response("audio"), 0.1)
+
+    assert response_output.text == ""
+    response = next(
+        event["response"]
+        for event in websocket.events
+        if event["type"] == "response.done"
+    )
+    assert response["status_details"]["reason"] == "turn_detected"
+    assert not second_speech_started.done()
+
+    websocket.release_second_speech_started.set()
+    await second_speech_started
 
 
 @pytest.mark.asyncio
