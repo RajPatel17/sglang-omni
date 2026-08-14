@@ -567,6 +567,55 @@ async def test_speech_blocks_queued_response_until_speech_stops(
 
 
 @pytest.mark.asyncio
+async def test_new_speech_cancels_dequeued_turn_waiting_for_speech_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def first_stream() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+        yield _chunk(modality="audio")
+        yield _chunk(modality="audio", finish_reason="stop")
+
+    async def unexpected_second_stream() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="unexpected second request")
+        yield _chunk(finish_reason="stop")
+
+    session, _, client = _session(
+        monkeypatch, [first_stream, unexpected_second_stream]
+    )
+    session.speech_idle.clear()
+    await session.response_queue.put(("queued-user-item", "audio"))
+    session.queue_drainer = asyncio.create_task(session.drain_queue())
+
+    for _ in range(100):
+        if session.response_queue.empty() and session.response_start_pending:
+            break
+        await asyncio.sleep(0)
+    assert session.response_queue.empty()
+    assert session.response_start_pending
+
+    await session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    session.speech_idle.set()
+
+    for _ in range(100):
+        if session.conversation:
+            break
+        await asyncio.sleep(0)
+
+    assert client.requests and len(client.requests) == 1
+    assert [(item.role, item.text) for item in session.conversation] == [
+        ("user", "question")
+    ]
+    response = next(
+        event["response"]
+        for event in session.websocket.events  # type: ignore[attr-defined]
+        if event["type"] == "response.done"
+    )
+    assert response["status_details"]["reason"] == "turn_detected"
+    await session.teardown()
+
+
+@pytest.mark.asyncio
 async def test_pending_response_is_cancelled_before_stream_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

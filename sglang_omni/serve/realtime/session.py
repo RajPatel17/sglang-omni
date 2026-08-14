@@ -410,11 +410,11 @@ class RealtimeSession:
     async def drain_queue(self) -> None:
         while not self.closed:
             item_id, payload = await self.response_queue.get()
-            await self.speech_idle.wait()
-            if self.closed:
-                break
             self.response_start_pending = True
             try:
+                await self.speech_idle.wait()
+                if self.closed:
+                    break
                 self.active_task = asyncio.create_task(self.run_turn(item_id, payload))
                 await asyncio.gather(self.active_task, return_exceptions=True)
             finally:
