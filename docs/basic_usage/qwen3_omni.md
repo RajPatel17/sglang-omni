@@ -379,6 +379,9 @@ also send `conversation.item.truncate` with the assistant `item_id` from
 `audio_end_ms`. The server replies with `conversation.item.truncated` and
 removes that assistant item from conversation history. The whole assistant
 transcript is removed because the endpoint cannot align text with played audio.
+The included browser derives `audio_end_ms` from the PCM intervals actually
+rendered by Web Audio and uses `getOutputTimestamp()` when available, so
+queued future audio and network underrun gaps are not reported as heard.
 
 Set `turn_detection.interrupt_response` to `false` in `session.update` to opt
 out. This is the only `turn_detection` field applied dynamically by the current

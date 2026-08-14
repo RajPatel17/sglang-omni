@@ -36,7 +36,7 @@
       if (responseId) {
         this.responseMetadata.set(responseId, {
           itemId: null,
-          playbackStartTime: null,
+          playbackIntervals: [],
           finished: false,
         });
         this.boundResponseMetadata();
@@ -74,21 +74,10 @@
       const records = [];
       responseIds.forEach((responseId) => {
         const metadata = this.responseMetadata.get(responseId);
-        const playbackStartTime = metadata && metadata.playbackStartTime;
         records.push({
           responseId,
           itemId: (metadata && metadata.itemId) || null,
-          audioEndMs:
-            this.context &&
-            playbackStartTime !== null &&
-            playbackStartTime !== undefined
-              ? Math.max(
-                  0,
-                  Math.floor(
-                    (this.context.currentTime - playbackStartTime) * 1000,
-                  ),
-                )
-              : 0,
+          audioEndMs: this.playedAudioMs(metadata),
         });
         if (!metadata || !metadata.finished) {
           this.cancelledResponseIds.add(responseId);
@@ -140,13 +129,15 @@
       );
       const metadata = this.responseMetadata.get(responseId) || {
         itemId: null,
-        playbackStartTime: null,
+        playbackIntervals: [],
         finished: false,
       };
       if (itemId) metadata.itemId = itemId;
-      if (metadata.playbackStartTime === null) {
-        metadata.playbackStartTime = startAt;
-      }
+      this.recordPlaybackInterval(
+        metadata,
+        startAt,
+        startAt + buffer.duration,
+      );
       this.responseMetadata.set(responseId, metadata);
       this.boundResponseMetadata();
       this.playbackResponseId = responseId;
@@ -154,6 +145,46 @@
       source.start(startAt);
       this.nextPlaybackTime = startAt + buffer.duration;
       return true;
+    }
+
+    currentOutputTime() {
+      if (!this.context) return 0;
+      if (typeof this.context.getOutputTimestamp === "function") {
+        const timestamp = this.context.getOutputTimestamp();
+        if (
+          timestamp &&
+          Number.isFinite(timestamp.contextTime) &&
+          (timestamp.contextTime > 0 || this.context.currentTime === 0)
+        ) {
+          return timestamp.contextTime;
+        }
+      }
+      return this.context.currentTime;
+    }
+
+    recordPlaybackInterval(metadata, startTime, endTime) {
+      const intervals = metadata.playbackIntervals;
+      const previous = intervals[intervals.length - 1];
+      if (previous && startTime <= previous.endTime + 1e-6) {
+        previous.endTime = Math.max(previous.endTime, endTime);
+      } else {
+        intervals.push({ startTime, endTime });
+      }
+    }
+
+    playedAudioMs(metadata) {
+      if (!metadata || !this.context) return 0;
+      const outputTime = this.currentOutputTime();
+      const playedSeconds = metadata.playbackIntervals.reduce(
+        (total, interval) =>
+          total +
+          Math.max(
+            0,
+            Math.min(outputTime, interval.endTime) - interval.startTime,
+          ),
+        0,
+      );
+      return Math.max(0, Math.floor(playedSeconds * 1000 + 1e-6));
     }
 
     flush(closeContext = false) {

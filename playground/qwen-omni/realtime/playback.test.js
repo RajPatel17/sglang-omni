@@ -54,7 +54,7 @@ function controller() {
       contexts.push(context);
       return context;
     },
-    decodeBase64: () => new Uint8Array([0, 0, 1, 0]),
+    decodeBase64: () => new Uint8Array(4800),
   });
   return { playback, contexts };
 }
@@ -123,7 +123,56 @@ test("interrupt reports the assistant item and played duration", () => {
     {
       responseId: "response-a",
       itemId: "assistant-a",
-      audioEndMs: 250,
+      audioEndMs: 100,
+    },
+  ]);
+});
+
+test("interrupt excludes network underrun gaps from played duration", () => {
+  const { playback, contexts } = controller();
+  playback.beginResponse("response-a");
+  playback.queueAudioDelta("first", "response-a", "assistant-a");
+  contexts[0].currentTime = 0.3;
+  playback.queueAudioDelta("second", "response-a", "assistant-a");
+  contexts[0].currentTime = 0.37;
+
+  assert.deepEqual(playback.interrupt(), [
+    {
+      responseId: "response-a",
+      itemId: "assistant-a",
+      audioEndMs: 150,
+    },
+  ]);
+});
+
+test("interrupt uses the audio output timestamp when available", () => {
+  const { playback, contexts } = controller();
+  playback.beginResponse("response-a");
+  playback.queueAudioDelta("audio", "response-a", "assistant-a");
+  contexts[0].currentTime = 0.5;
+  contexts[0].getOutputTimestamp = () => ({ contextTime: 0.08 });
+
+  assert.deepEqual(playback.interrupt(), [
+    {
+      responseId: "response-a",
+      itemId: "assistant-a",
+      audioEndMs: 60,
+    },
+  ]);
+});
+
+test("interrupt ignores an uninitialized audio output timestamp", () => {
+  const { playback, contexts } = controller();
+  playback.beginResponse("response-a");
+  playback.queueAudioDelta("audio", "response-a", "assistant-a");
+  contexts[0].currentTime = 0.07;
+  contexts[0].getOutputTimestamp = () => ({ contextTime: 0 });
+
+  assert.deepEqual(playback.interrupt(), [
+    {
+      responseId: "response-a",
+      itemId: "assistant-a",
+      audioEndMs: 50,
     },
   ]);
 });

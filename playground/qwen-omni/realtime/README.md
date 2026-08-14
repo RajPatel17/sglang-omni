@@ -103,7 +103,10 @@ node --test playground/qwen-omni/realtime/playback.test.js
   `response.audio.delta`, `content_index: 0`, and the played duration in
   `audio_end_ms`. The server replies with `conversation.item.truncated` and
   removes that assistant item from conversation history. It removes the whole
-  assistant transcript because audio and text are not aligned.
+  assistant transcript because audio and text are not aligned. The included
+  browser calculates `audio_end_ms` from the PCM intervals actually rendered
+  by Web Audio, using `getOutputTimestamp()` when available. Queued future
+  audio and network underrun gaps are not counted as heard playback.
 - Automatic interruption ends with `response.done.status="cancelled"` and
   reason `turn_detected`; explicit `response.cancel` uses `client_cancelled`.
 - To opt out for a specific audio session, set:
