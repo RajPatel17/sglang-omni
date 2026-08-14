@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketState
 
 from sglang_omni.client.types import CompletionStreamChunk
 from sglang_omni.serve.realtime import session as session_module
+from sglang_omni.serve.realtime.events import ResponseCancel
 from sglang_omni.serve.realtime.session import RealtimeSession
 from sglang_omni.serve.realtime.vad import Emit, VADEvent
 
@@ -363,6 +364,54 @@ async def test_repeated_pending_barge_in_keeps_first_terminal_gate(
 
     websocket.release_second_speech_started.set()
     await second_speech_started
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_before_speech_keeps_client_cancelled_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "StreamingVAD", FakeVAD)
+    response_started = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        response_started.set()
+        yield _chunk(text="partial")
+        yield _chunk(modality="audio")
+        await asyncio.Event().wait()
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    websocket = BlockingSpeechStartedWebSocket()
+    client = ScriptedClient([response, transcription])
+    session = RealtimeSession(
+        websocket,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        model_name="qwen3-omni",
+        supports_audio_output=True,
+    )
+    session.session_object.modalities = ["text", "audio"]
+    turn = asyncio.create_task(session.run_turn("item-user", "audio"))
+    await response_started.wait()
+
+    await session.handle_response_cancel(ResponseCancel(type="response.cancel"))
+    speech_started = asyncio.create_task(
+        session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    )
+    await websocket.speech_started_send.wait()
+    await asyncio.wait_for(turn, 1)
+
+    response = next(
+        event["response"]
+        for event in websocket.events
+        if event["type"] == "response.done"
+    )
+    assert response["status_details"]["reason"] == "client_cancelled"
+    assert not speech_started.done()
+
+    websocket.release_speech_started.set()
+    await speech_started
 
 
 @pytest.mark.asyncio

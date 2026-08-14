@@ -536,16 +536,10 @@ class RealtimeSession:
                 self._remember_cancelled_assistant_item(resp_item_id)
             response_done = True
 
-        async def emit_terminals_safely(**kwargs: Any) -> None:
-            terminal_gate = (
-                self.cancelled_response_terminal_gate
-                if self.cancelled_response_request_id == request_id
-                else None
-            )
-            if (
-                kwargs.get("reason") == "turn_detected"
-                and terminal_gate is not None
-            ):
+        async def emit_terminals_safely(
+            *, terminal_gate: asyncio.Event | None = None, **kwargs: Any
+        ) -> None:
+            if terminal_gate is not None:
                 await terminal_gate.wait()
             terminal_task = asyncio.create_task(emit_terminals(**kwargs))
             try:
@@ -554,11 +548,17 @@ class RealtimeSession:
                 await terminal_task
                 raise
 
-        async def claim_terminal() -> bool:
+        async def claim_terminal() -> tuple[bool, str | None, asyncio.Event | None]:
             async with self.response_state_lock:
                 cancelled = self.cancelled_response_request_id == request_id
+                cancel_reason = (
+                    self.cancelled_response_reason if cancelled else None
+                )
+                terminal_gate = (
+                    self.cancelled_response_terminal_gate if cancelled else None
+                )
                 self.finalized_response_request_id = request_id
-                return cancelled
+                return cancelled, cancel_reason, terminal_gate
 
         try:
             await self.send(
@@ -584,8 +584,9 @@ class RealtimeSession:
                     self.cancelled_response_reason = reason
                     self.cancelled_response_terminal_gate = terminal_gate
             if reason is not None:
-                await claim_terminal()
+                _, _, terminal_gate = await claim_terminal()
                 await emit_terminals_safely(
+                    terminal_gate=terminal_gate,
                     response_text="",
                     include_audio=False,
                     status="cancelled",
@@ -668,13 +669,14 @@ class RealtimeSession:
                     audio_done = True
 
             response_text = "".join(text_acc)
-            cancelled = await claim_terminal()
+            cancelled, cancel_reason, terminal_gate = await claim_terminal()
             if cancelled:
                 await emit_terminals_safely(
+                    terminal_gate=terminal_gate,
                     response_text=response_text,
                     include_audio=wants_audio and saw_audio,
                     status="cancelled",
-                    reason=self.cancelled_response_reason or "client_cancelled",
+                    reason=cancel_reason or "client_cancelled",
                 )
                 return ResponseOutput(item_id=resp_item_id, text="")
 
@@ -702,17 +704,18 @@ class RealtimeSession:
             return ResponseOutput(item_id=resp_item_id, text=response_text)
         except asyncio.CancelledError:
             if not response_done:
-                await claim_terminal()
+                _, cancel_reason, terminal_gate = await claim_terminal()
                 await emit_terminals_safely(
+                    terminal_gate=terminal_gate,
                     response_text="".join(text_acc),
                     include_audio=wants_audio and saw_audio,
                     status="cancelled",
-                    reason=self.cancelled_response_reason or "client_cancelled",
+                    reason=cancel_reason or "client_cancelled",
                 )
             raise
         except Exception as exc:
             response_text = "".join(text_acc)
-            cancelled = await claim_terminal()
+            cancelled, cancel_reason, terminal_gate = await claim_terminal()
             if not cancelled:
                 asyncio.get_running_loop().call_exception_handler(
                     {
@@ -722,11 +725,12 @@ class RealtimeSession:
                 )
             if not response_done:
                 await emit_terminals_safely(
+                    terminal_gate=terminal_gate,
                     response_text=response_text,
                     include_audio=wants_audio and saw_audio,
                     status="cancelled" if cancelled else "failed",
                     reason=(
-                        (self.cancelled_response_reason or "client_cancelled")
+                        (cancel_reason or "client_cancelled")
                         if cancelled
                         else "error"
                     ),
