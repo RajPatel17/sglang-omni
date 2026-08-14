@@ -121,6 +121,7 @@ class RealtimeSession:
         self.finalized_response_request_id: str | None = None
         self.response_state_lock = asyncio.Lock()
         self.active_response_abort_task: asyncio.Task | None = None
+        self.pending_barge_in_event: asyncio.Event | None = None
         self.response_start_pending = False
         self.pending_response_cancel_reason: str | None = None
         self.pending_assistant_item_ids: set[str] = set()
@@ -231,13 +232,6 @@ class RealtimeSession:
             vad_byte = self.sample_offset_to_buffer_byte(emit.sample_offset)
             self.utterance_start_byte = min(vad_byte, self.audio_buffer.num_bytes)
             self.utterance_item_id = new_id("item")
-            await self.send(
-                make_event(
-                    "input_audio_buffer.speech_started",
-                    audio_start_ms=timestamp_ms,
-                    item_id=self.utterance_item_id,
-                )
-            )
             turn_detection = self.session_object.turn_detection
             interrupt_response = (
                 turn_detection is None or turn_detection.interrupt_response is not False
@@ -246,8 +240,24 @@ class RealtimeSession:
                 self.response_start_pending
                 and "audio" in self.session_object.modalities
             )
+            barge_in_event = None
             if response_has_audio and interrupt_response:
+                barge_in_event = asyncio.Event()
+                self.pending_barge_in_event = barge_in_event
                 await self.cancel_active_response("turn_detected")
+            try:
+                await self.send(
+                    make_event(
+                        "input_audio_buffer.speech_started",
+                        audio_start_ms=timestamp_ms,
+                        item_id=self.utterance_item_id,
+                    )
+                )
+            finally:
+                if barge_in_event is not None:
+                    barge_in_event.set()
+                    if self.pending_barge_in_event is barge_in_event:
+                        self.pending_barge_in_event = None
         elif emit.event_type == VADEvent.SPEECH_STOPPED:
             await self.send(
                 make_event(
@@ -522,6 +532,12 @@ class RealtimeSession:
             response_done = True
 
         async def emit_terminals_safely(**kwargs: Any) -> None:
+            barge_in_event = self.pending_barge_in_event
+            if (
+                kwargs.get("reason") == "turn_detected"
+                and barge_in_event is not None
+            ):
+                await barge_in_event.wait()
             terminal_task = asyncio.create_task(emit_terminals(**kwargs))
             try:
                 await asyncio.shield(terminal_task)

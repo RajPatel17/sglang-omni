@@ -37,6 +37,20 @@ class RecordingWebSocket:
         self.client_state = WebSocketState.DISCONNECTED
 
 
+class BlockingSpeechStartedWebSocket(RecordingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.speech_started_send = asyncio.Event()
+        self.release_speech_started = asyncio.Event()
+
+    async def send_text(self, payload: str) -> None:
+        event = json.loads(payload)
+        if event["type"] == "input_audio_buffer.speech_started":
+            self.speech_started_send.set()
+            await self.release_speech_started.wait()
+        self.events.append(event)
+
+
 StreamFactory = Callable[[], AsyncIterator[CompletionStreamChunk]]
 
 
@@ -143,6 +157,63 @@ async def test_abort_finishes_before_transcription_and_omits_cancelled_history(
         e["response"] for e in websocket.events if e["type"] == "response.done"
     )
     assert response["status_details"]["reason"] == "turn_detected"
+
+
+@pytest.mark.asyncio
+async def test_barge_in_aborts_before_speech_started_send_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "StreamingVAD", FakeVAD)
+    response_started = asyncio.Event()
+    abort_started = asyncio.Event()
+    abort_done = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        response_started.set()
+        yield _chunk(text="partial")
+        yield _chunk(modality="audio")
+        await abort_done.wait()
+        raise RuntimeError("aborted stream")
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    websocket = BlockingSpeechStartedWebSocket()
+    client = ScriptedClient([response, transcription])
+    session = RealtimeSession(
+        websocket,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        model_name="qwen3-omni",
+        supports_audio_output=True,
+    )
+    session.session_object.modalities = ["text", "audio"]
+
+    async def abort() -> None:
+        abort_started.set()
+        abort_done.set()
+
+    client.abort_hook = abort
+    turn = asyncio.create_task(session.run_turn("item-user", "audio"))
+    await response_started.wait()
+    speech_started = asyncio.create_task(
+        session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    )
+    await websocket.speech_started_send.wait()
+    await asyncio.wait_for(abort_started.wait(), 0.1)
+    await asyncio.sleep(0)
+
+    assert not speech_started.done()
+    assert not any(event["type"] == "response.done" for event in websocket.events)
+
+    websocket.release_speech_started.set()
+    await speech_started
+    await turn
+
+    types = [event["type"] for event in websocket.events]
+    assert types.index("input_audio_buffer.speech_started") < types.index(
+        "response.done"
+    )
 
 
 @pytest.mark.asyncio
