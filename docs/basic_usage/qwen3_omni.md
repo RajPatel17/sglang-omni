@@ -370,9 +370,10 @@ The server marks and aborts the active generation before waiting on the
 outbound `speech_started` WebSocket send. This prevents a slow or backpressured
 client from extending model work after speech has already been detected.
 Automatic `turn_detected` cancellation terminals remain gated behind
-`speech_started`, preserving the documented wire order. If the client already
-sent `response.cancel`, that earlier explicit cancellation remains
-`client_cancelled`.
+`speech_started`, preserving the documented wire order. Cancellation reasons
+are first-processed-wins: an explicit `response.cancel` processed before VAD
+remains `client_cancelled`; once VAD cancellation is processed, a later
+explicit cancel does not rewrite `turn_detected`.
 
 Clients must stop buffered playback on `speech_started` and reject every later
 `response.audio.delta` for that response until its `response.done`. If speech

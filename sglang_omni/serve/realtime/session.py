@@ -242,12 +242,12 @@ class RealtimeSession:
                 and "audio" in self.session_object.modalities
             )
             barge_in_event = None
-            if response_has_audio and interrupt_response:
-                barge_in_event = asyncio.Event()
-                await self.cancel_active_response(
-                    "turn_detected", terminal_gate=barge_in_event
-                )
             try:
+                if response_has_audio and interrupt_response:
+                    barge_in_event = asyncio.Event()
+                    await self.cancel_active_response(
+                        "turn_detected", terminal_gate=barge_in_event
+                    )
                 await self.send(
                     make_event(
                         "input_audio_buffer.speech_started",
