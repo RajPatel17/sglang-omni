@@ -6,6 +6,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
+from itertools import count
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -121,6 +122,7 @@ class CommEngine:
         ] = {}
         self._send_workers: dict[str, asyncio.Task] = {}
         self._pending: dict[str, _PendingTransfer] = {}
+        self._stream_send_sequence = count()
         # Failed pending KV transfers stay pinned until this dying process exits.
         self._retained_pending_kv_transfers: list[_PendingTransfer] = []
         self._kv_pools: dict[str, KVPool] = {}
@@ -821,6 +823,10 @@ class CommEngine:
 
     async def _run_stream_send(self, job: _StreamSendJob, queue_key: str) -> None:
         object_id: str | None = None
+        stream_object_id = (
+            f"{job.request_id}:stream:{job.from_stage}:{job.target_stage}:"
+            f"{job.chunk_id}:{next(self._stream_send_sequence)}"
+        )
         send_start = _comm_now_ns()
         write_ms = -1.0
         control_ms = -1.0
@@ -833,6 +839,7 @@ class CommEngine:
                 target_stage=job.target_stage,
                 from_stage=job.from_stage,
                 chunk_id=job.chunk_id,
+                object_id=stream_object_id,
                 metadata=job.metadata,
                 transport=job.transport,
             )
