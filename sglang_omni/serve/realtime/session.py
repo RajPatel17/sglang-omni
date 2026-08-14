@@ -41,6 +41,7 @@ _TRANSCRIPTION_PROMPT = (
 )
 
 _MAX_CANCELLED_ASSISTANT_ITEM_IDS = 64
+_MAX_TRACKED_ASSISTANT_TEXT_CHARS = 16_384
 
 HANDLERS: dict[type, str] = {
     SessionUpdate: "handle_session_update",
@@ -78,8 +79,8 @@ class RealtimeSession:
          prompt, streams ``conversation.item.input_audio_transcription.*`` for
          history/UI/log.
       3. The transcript and completed assistant response are appended to
-         ``self.conversation``. Cancelled assistant output is omitted, and a
-         client truncate event removes completed output interrupted in playback.
+         ``self.conversation``. Cancelled assistant output is omitted unless a
+         truncate event supplies the exact text heard before playback stopped.
     """
 
     def __init__(
@@ -125,7 +126,9 @@ class RealtimeSession:
         self.pending_response_cancel_reason: str | None = None
         self.pending_assistant_item_ids: set[str] = set()
         self.truncated_assistant_item_ids: set[str] = set()
-        self.cancelled_assistant_item_ids: dict[str, None] = {}
+        self.truncated_assistant_texts: dict[str, str] = {}
+        self.assistant_item_texts: dict[str, str] = {}
+        self.cancelled_assistant_item_ids: dict[str, str | None] = {}
         self.speech_idle = asyncio.Event()
         self.speech_idle.set()
         # VAD may emit speech_stopped while engine is still busy on an
@@ -306,10 +309,26 @@ class RealtimeSession:
         await self.cancel_active_response("client_cancelled")
 
     def _remember_cancelled_assistant_item(self, item_id: str) -> None:
-        self.cancelled_assistant_item_ids[item_id] = None
+        self.cancelled_assistant_item_ids.setdefault(item_id, None)
         if len(self.cancelled_assistant_item_ids) > _MAX_CANCELLED_ASSISTANT_ITEM_IDS:
             oldest_item_id = next(iter(self.cancelled_assistant_item_ids))
             del self.cancelled_assistant_item_ids[oldest_item_id]
+            self.assistant_item_texts.pop(oldest_item_id, None)
+            self.truncated_assistant_item_ids.discard(oldest_item_id)
+            self.truncated_assistant_texts.pop(oldest_item_id, None)
+
+    def _assistant_text(self, item_id: str) -> str | None:
+        tracked_text = self.assistant_item_texts.get(item_id)
+        if tracked_text is not None:
+            return tracked_text
+        return next(
+            (
+                item.text
+                for item in self.conversation
+                if item.item_id == item_id and item.role == "assistant"
+            ),
+            None,
+        )
 
     async def handle_conversation_item_truncate(
         self, event: ConversationItemTruncate
@@ -322,25 +341,71 @@ class RealtimeSession:
             )
             return
 
-        if event.item_id in self.pending_assistant_item_ids:
-            self.truncated_assistant_item_ids.add(event.item_id)
-        elif event.item_id not in self.cancelled_assistant_item_ids:
-            item_index = next(
-                (
-                    index
-                    for index, item in enumerate(self.conversation)
-                    if item.item_id == event.item_id and item.role == "assistant"
-                ),
-                None,
+        pending = event.item_id in self.pending_assistant_item_ids
+        cancelled = event.item_id in self.cancelled_assistant_item_ids
+        item_index = next(
+            (
+                index
+                for index, item in enumerate(self.conversation)
+                if item.item_id == event.item_id and item.role == "assistant"
+            ),
+            None,
+        )
+        if not pending and not cancelled and item_index is None:
+            await self.send_error(
+                "invalid_request_error",
+                "item_not_found",
+                f"Assistant item {event.item_id!r} was not found.",
             )
-            if item_index is None:
-                await self.send_error(
-                    "invalid_request_error",
-                    "item_not_found",
-                    f"Assistant item {event.item_id!r} was not found.",
+            return
+
+        generated_text = self._assistant_text(event.item_id) or ""
+        if event.heard_text is not None and not generated_text.startswith(
+            event.heard_text
+        ):
+            await self.send_error(
+                "invalid_request_error",
+                "invalid_heard_text",
+                "heard_text must be an exact prefix of the generated assistant text.",
+            )
+            return
+
+        if pending:
+            self.truncated_assistant_item_ids.add(event.item_id)
+            if event.heard_text:
+                self.truncated_assistant_texts[event.item_id] = event.heard_text
+            else:
+                self.truncated_assistant_texts.pop(event.item_id, None)
+        elif item_index is not None:
+            if event.heard_text:
+                self.conversation[item_index].text = event.heard_text
+            else:
+                del self.conversation[item_index]
+        elif event.heard_text:
+            parent_item_id = self.cancelled_assistant_item_ids[event.item_id]
+            if parent_item_id is None:
+                self.truncated_assistant_item_ids.add(event.item_id)
+                self.truncated_assistant_texts[event.item_id] = event.heard_text
+            else:
+                parent_index = next(
+                    (
+                        index
+                        for index, item in enumerate(self.conversation)
+                        if item.item_id == parent_item_id and item.role == "user"
+                    ),
+                    None,
                 )
-                return
-            del self.conversation[item_index]
+                if parent_index is not None:
+                    self.conversation.insert(
+                        parent_index + 1,
+                        ConversationItem(
+                            role="assistant",
+                            text=event.heard_text,
+                            item_id=event.item_id,
+                        ),
+                    )
+                    self.cancelled_assistant_item_ids.pop(event.item_id, None)
+                    self.assistant_item_texts.pop(event.item_id, None)
 
         await self.send(
             make_event(
@@ -434,22 +499,32 @@ class RealtimeSession:
                 self.conversation.append(
                     ConversationItem(role="user", text=transcript, item_id=item_id)
                 )
-            if (
-                response_output is not None
-                and response_output.text
-                and response_output.item_id not in self.truncated_assistant_item_ids
-            ):
-                self.conversation.append(
-                    ConversationItem(
-                        role="assistant",
-                        text=response_output.text,
-                        item_id=response_output.item_id,
+            if response_output is not None:
+                response_item_id = response_output.item_id
+                if response_item_id in self.cancelled_assistant_item_ids:
+                    self.cancelled_assistant_item_ids[response_item_id] = item_id
+                assistant_text = response_output.text
+                if response_item_id in self.truncated_assistant_item_ids:
+                    assistant_text = self.truncated_assistant_texts.get(
+                        response_item_id, ""
                     )
-                )
+                if assistant_text:
+                    self.conversation.append(
+                        ConversationItem(
+                            role="assistant",
+                            text=assistant_text,
+                            item_id=response_item_id,
+                        )
+                    )
+                    self.cancelled_assistant_item_ids.pop(response_item_id, None)
+                    self.assistant_item_texts.pop(response_item_id, None)
         finally:
             if response_output is not None:
                 self.pending_assistant_item_ids.discard(response_output.item_id)
                 self.truncated_assistant_item_ids.discard(response_output.item_id)
+                self.truncated_assistant_texts.pop(response_output.item_id, None)
+                if response_output.item_id not in self.cancelled_assistant_item_ids:
+                    self.assistant_item_texts.pop(response_output.item_id, None)
 
     async def run_response(self, audio_payload: str) -> ResponseOutput:
         """Stream the assistant response and wait for every active terminal."""
@@ -471,6 +546,7 @@ class RealtimeSession:
         retain_for_history = False
         if wants_audio:
             self.pending_assistant_item_ids.add(resp_item_id)
+            self.assistant_item_texts[resp_item_id] = ""
 
         async def emit_terminals(
             *,
@@ -575,6 +651,15 @@ class RealtimeSession:
 
                 if chunk.text and (chunk.modality == "text" or not text_acc):
                     text_acc.append(chunk.text)
+                    if wants_audio:
+                        tracked_text = self.assistant_item_texts[resp_item_id]
+                        remaining = (
+                            _MAX_TRACKED_ASSISTANT_TEXT_CHARS - len(tracked_text)
+                        )
+                        if remaining > 0:
+                            self.assistant_item_texts[resp_item_id] = (
+                                tracked_text + chunk.text[:remaining]
+                            )
                     await self.send(
                         make_event(
                             "response.text.delta",
@@ -648,6 +733,7 @@ class RealtimeSession:
                     status="cancelled",
                     reason=self.cancelled_response_reason or "client_cancelled",
                 )
+                retain_for_history = wants_audio and saw_audio
                 return ResponseOutput(item_id=resp_item_id, text="")
 
             if wants_audio and not saw_audio:
@@ -673,15 +759,19 @@ class RealtimeSession:
             retain_for_history = wants_audio
             return ResponseOutput(item_id=resp_item_id, text=response_text)
         except asyncio.CancelledError:
+            reason = self.cancelled_response_reason or self.response_cancel_reason
             if not response_done:
                 await claim_terminal()
                 await emit_terminals_safely(
                     response_text="".join(text_acc),
                     include_audio=wants_audio and saw_audio,
                     status="cancelled",
-                    reason=self.cancelled_response_reason or "client_cancelled",
+                    reason=reason or "client_cancelled",
                 )
-            raise
+            if self.turn_cancel_requested or reason is None:
+                raise
+            retain_for_history = wants_audio and saw_audio
+            return ResponseOutput(item_id=resp_item_id, text="")
         except Exception as exc:
             response_text = "".join(text_acc)
             cancelled = await claim_terminal()
@@ -712,11 +802,15 @@ class RealtimeSession:
                         )
                     ),
                 )
+            if cancelled:
+                retain_for_history = wants_audio and saw_audio
             return ResponseOutput(item_id=resp_item_id, text="")
         finally:
             if wants_audio and not retain_for_history:
                 self.pending_assistant_item_ids.discard(resp_item_id)
                 self.truncated_assistant_item_ids.discard(resp_item_id)
+                self.truncated_assistant_texts.pop(resp_item_id, None)
+                self.assistant_item_texts.pop(resp_item_id, None)
             if self.active_request_id == request_id:
                 self.active_request_id = None
             async with self.response_state_lock:

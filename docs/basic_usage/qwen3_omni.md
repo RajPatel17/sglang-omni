@@ -376,9 +376,16 @@ the response when its ID arrives. Automatic barge-in ends with
 If assistant audio has already been scheduled for playback, the client must
 also send `conversation.item.truncate` with the assistant `item_id` from
 `response.audio.delta`, `content_index: 0`, and the played duration in
-`audio_end_ms`. The server replies with `conversation.item.truncated` and
-removes that assistant item from conversation history. The whole assistant
-transcript is removed because the endpoint cannot align text with played audio.
+`audio_end_ms`. By default, the server replies with
+`conversation.item.truncated` and removes that assistant item from conversation
+history because the endpoint cannot infer text/audio alignment.
+
+Applications that do have playback-aligned captions may also send
+`heard_text`, containing the exact generated-text prefix the user actually
+heard. The server verifies that it is a prefix of the model output and retains
+only that prefix in conversation history. The field is capped at 16,384
+characters. Do not send displayed text that was queued but not yet played;
+omit `heard_text` when exact alignment is unavailable.
 
 Set `turn_detection.interrupt_response` to `false` in `session.update` to opt
 out. This is the only `turn_detection` field applied dynamically by the current

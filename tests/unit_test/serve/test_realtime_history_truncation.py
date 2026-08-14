@@ -81,6 +81,42 @@ async def test_truncate_before_history_append_omits_pending_assistant(
 
 
 @pytest.mark.asyncio
+async def test_truncate_before_history_append_retains_exact_heard_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcription_started = asyncio.Event()
+    release_transcription = asyncio.Event()
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        transcription_started.set()
+        await release_transcription.wait()
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    session, websocket, _ = _session(monkeypatch, [_response_stream, transcription])
+    turn = asyncio.create_task(session.run_turn("user-item", "audio"))
+    await transcription_started.wait()
+    assistant_item_id = _assistant_item_id(websocket.events)
+
+    await session.dispatch(
+        {
+            "type": "conversation.item.truncate",
+            "item_id": assistant_item_id,
+            "content_index": 0,
+            "audio_end_ms": 240,
+            "heard_text": "full assistant",
+        }
+    )
+    release_transcription.set()
+    await turn
+
+    assert [(item.role, item.text) for item in session.conversation] == [
+        ("user", "question"),
+        ("assistant", "full assistant"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_truncate_after_history_append_removes_recorded_assistant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -103,6 +139,34 @@ async def test_truncate_after_history_append_removes_recorded_assistant(
 
     assert [(item.role, item.text) for item in session.conversation] == [
         ("user", "question")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_truncate_after_history_append_replaces_with_exact_heard_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    session, websocket, _ = _session(monkeypatch, [_response_stream, transcription])
+    await session.run_turn("user-item", "audio")
+    assistant_item_id = _assistant_item_id(websocket.events)
+
+    await session.dispatch(
+        {
+            "type": "conversation.item.truncate",
+            "item_id": assistant_item_id,
+            "content_index": 0,
+            "audio_end_ms": 400,
+            "heard_text": "full assistant",
+        }
+    )
+
+    assert [(item.role, item.text) for item in session.conversation] == [
+        ("user", "question"),
+        ("assistant", "full assistant"),
     ]
 
 
@@ -154,6 +218,77 @@ async def test_truncate_after_cancelled_response_is_acknowledged(
     assert [(item.role, item.text) for item in session.conversation] == [
         ("user", "question")
     ]
+
+
+@pytest.mark.asyncio
+async def test_truncate_after_cancelled_response_retains_exact_heard_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_emitted = asyncio.Event()
+
+    async def response() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="partial assistant answer")
+        yield _chunk(modality="audio")
+        audio_emitted.set()
+        await asyncio.Event().wait()
+
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    session, websocket, _ = _session(monkeypatch, [response, transcription])
+    turn = asyncio.create_task(session.run_turn("user-item", "audio"))
+    await audio_emitted.wait()
+    assistant_item_id = next(
+        event["item_id"]
+        for event in websocket.events
+        if event["type"] == "response.audio.delta"
+    )
+    await session.handle_vad_emit(Emit(VADEvent.SPEECH_STARTED, 0))
+    await turn
+
+    await session.dispatch(
+        {
+            "type": "conversation.item.truncate",
+            "item_id": assistant_item_id,
+            "content_index": 0,
+            "audio_end_ms": 240,
+            "heard_text": "partial assistant",
+        }
+    )
+
+    assert [(item.role, item.text) for item in session.conversation] == [
+        ("user", "question"),
+        ("assistant", "partial assistant"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_truncate_rejects_text_not_generated_by_assistant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def transcription() -> AsyncIterator[CompletionStreamChunk]:
+        yield _chunk(text="question")
+        yield _chunk(finish_reason="stop")
+
+    session, websocket, _ = _session(monkeypatch, [_response_stream, transcription])
+    await session.run_turn("user-item", "audio")
+    assistant_item_id = _assistant_item_id(websocket.events)
+    history_before = list(session.conversation)
+
+    await session.dispatch(
+        {
+            "type": "conversation.item.truncate",
+            "item_id": assistant_item_id,
+            "content_index": 0,
+            "audio_end_ms": 100,
+            "heard_text": "invented context",
+        }
+    )
+
+    assert session.conversation == history_before
+    assert websocket.events[-1]["type"] == "error"
+    assert websocket.events[-1]["error"]["code"] == "invalid_heard_text"
 
 
 @pytest.mark.asyncio
