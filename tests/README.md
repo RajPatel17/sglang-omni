@@ -142,7 +142,9 @@ tests/
     │   ├── test_generation_batch_policy.py
     │   ├── test_generation_server_args.py
     │   ├── test_openai_api.py
-    │   └── test_speech_to_text.py
+    │   ├── test_speech_to_text.py
+    │   ├── test_translation_capability.py
+    │   └── test_translations.py
     ├── scheduling/
     │   ├── test_engine_factory.py
     │   ├── test_pipeline_state.py

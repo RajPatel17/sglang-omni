@@ -432,10 +432,12 @@ async def write_stream_chunk(
     target_stage: str,
     from_stage: str,
     chunk_id: int,
+    object_id: str | None = None,
     metadata: dict | None = None,
     transport: TransportKind,
 ) -> tuple[DataRef, list[Any]]:
-    object_id = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
+    if object_id is None:
+        object_id = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
     data_ref, op = await write_tensor(
         relay,
         object_id,
