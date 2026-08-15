@@ -31,6 +31,10 @@ class WhisperASRPipelineConfig(PipelineConfig):
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
         return {"generation": "asr"}
 
+    def supports_audio_translation(self) -> bool:
+        """Multilingual non-turbo Whisper checkpoints translate speech to English."""
+        return True
+
     model_path: str
     entry_stage: str = "asr"
     stages: list[StageConfig] = [
