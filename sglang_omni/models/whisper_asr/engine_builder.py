@@ -30,12 +30,13 @@ def _resolve_encoder_graph_buckets(
     pre_lm_max_batch_size: int,
     max_prefill_tokens: int,
     encoder_token_count: int,
+    max_running_requests: int | None,
 ) -> tuple[int, ...]:
     # note (guozhihao-224): pre-LM encoding is no longer limited by atomic prefill
     # admission, so capture against pre_lm_max_batch_size. Keep
     # max_prefill_tokens // encoder_token_count only for encoder-in-prefill.
     if enable_pre_lm_encoder:
-        max_encoder_batch_size = pre_lm_max_batch_size
+        capture_limit = pre_lm_max_batch_size
     else:
         if max_prefill_tokens < 1:
             raise ValueError(
@@ -45,8 +46,17 @@ def _resolve_encoder_graph_buckets(
             raise ValueError(
                 f"encoder_token_count must be >= 1, got {encoder_token_count}"
             )
-        max_encoder_batch_size = max_prefill_tokens // encoder_token_count
-    return tuple(bucket for bucket in buckets if bucket <= max_encoder_batch_size)
+        capture_limit = max_prefill_tokens // encoder_token_count
+    if max_running_requests is not None:
+        if max_running_requests < 1:
+            raise ValueError(
+                "max_running_requests must be >= 1, " f"got {max_running_requests}"
+            )
+        capture_limit = min(capture_limit, max_running_requests)
+    resolved = {bucket for bucket in buckets if bucket <= capture_limit}
+    if max_running_requests is not None and capture_limit >= 1:
+        resolved.add(capture_limit)
+    return tuple(sorted(resolved))
 
 
 class WhisperASREngineBuilder(AsrEngineBuilder):
@@ -62,6 +72,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         enable_encoder_cuda_graph: bool = False,
         encoder_graph_batch_buckets: list[int] | None = None,
         request_build_max_workers: int = 8,
+        enable_async_decode: bool = True,
+        async_decode_min_batch_size: int = 2,
         request_build_max_pending: int | None = 16,
         prefill_coalesce_requests: int = 2,
         prefill_coalesce_wait_ms: float = 6.0,
@@ -69,8 +81,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_requires_pending_builds: bool = True,
         prefill_coalesce_after_builds_during_decode: bool = False,
         enable_pre_lm_encoder: bool = True,
-        pre_lm_cache_max_entries: int = 4096,
-        pre_lm_cache_size_bytes: int = 2 * 1024**3,
+        pre_lm_cache_max_entries: int = 1024,
+        pre_lm_cache_size_bytes: int | None = None,
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
     ) -> None:
@@ -86,9 +98,12 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         self.max_new_tokens = max_new_tokens
         self.mem_fraction_static = mem_fraction_static
         self.enable_encoder_cuda_graph = bool(enable_encoder_cuda_graph)
+        self._using_default_encoder_graph_buckets = encoder_graph_batch_buckets is None
         self.encoder_graph_batch_buckets = _normalize_encoder_graph_buckets(
             encoder_graph_batch_buckets
         )
+        self.enable_async_decode = enable_async_decode
+        self.async_decode_min_batch_size = async_decode_min_batch_size
         self.request_build_max_workers = request_build_max_workers
         self.request_build_max_pending = request_build_max_pending
         self.prefill_coalesce_requests = prefill_coalesce_requests
@@ -102,7 +117,10 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         )
         self.enable_pre_lm_encoder = bool(enable_pre_lm_encoder)
         self.pre_lm_cache_max_entries = int(pre_lm_cache_max_entries)
-        self.pre_lm_cache_size_bytes = int(pre_lm_cache_size_bytes)
+        # None: derive the byte budget from the entry count (see encoder_service).
+        self.pre_lm_cache_size_bytes = (
+            None if pre_lm_cache_size_bytes is None else int(pre_lm_cache_size_bytes)
+        )
         self.pre_lm_max_batch_size = int(pre_lm_max_batch_size)
         self.pre_lm_max_batch_wait_ms = int(pre_lm_max_batch_wait_ms)
         self.processor: Any = None
@@ -140,29 +158,38 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         *,
         generation_cuda_graph_enabled: bool,
     ) -> None:
-        if self.enable_encoder_cuda_graph and generation_cuda_graph_enabled:
-            max_prefill_tokens = int(server_args.max_prefill_tokens)
-            resolved_buckets = _resolve_encoder_graph_buckets(
-                self.encoder_graph_batch_buckets,
-                enable_pre_lm_encoder=self.enable_pre_lm_encoder,
-                pre_lm_max_batch_size=self.pre_lm_max_batch_size,
-                max_prefill_tokens=max_prefill_tokens,
-                encoder_token_count=self.encoder_token_count,
-            )
-            logger.info(
-                "Resolved Whisper encoder CUDA graph buckets configured=%s "
-                "reachable=%s pre_lm=%s max_prefill_tokens=%d "
-                "encoder_token_count=%d",
-                self.encoder_graph_batch_buckets,
-                resolved_buckets,
-                self.enable_pre_lm_encoder,
-                max_prefill_tokens,
-                self.encoder_token_count,
-            )
-            model.init_encoder_graphs(
-                resolved_buckets,
-                int(self.processor.feature_extractor.nb_max_frames),
-            )
+        if not self.enable_encoder_cuda_graph or not generation_cuda_graph_enabled:
+            return
+
+        max_prefill_tokens = int(server_args.max_prefill_tokens)
+        max_running_requests = int(server_args.max_running_requests)
+        resolved_buckets = _resolve_encoder_graph_buckets(
+            self.encoder_graph_batch_buckets,
+            enable_pre_lm_encoder=self.enable_pre_lm_encoder,
+            pre_lm_max_batch_size=self.pre_lm_max_batch_size,
+            max_prefill_tokens=max_prefill_tokens,
+            encoder_token_count=self.encoder_token_count,
+            max_running_requests=(
+                max_running_requests
+                if self._using_default_encoder_graph_buckets
+                else None
+            ),
+        )
+        logger.info(
+            "Resolved Whisper encoder CUDA graph buckets configured=%s "
+            "reachable=%s pre_lm=%s max_prefill_tokens=%d "
+            "encoder_token_count=%d max_running_requests=%d",
+            self.encoder_graph_batch_buckets,
+            resolved_buckets,
+            self.enable_pre_lm_encoder,
+            max_prefill_tokens,
+            self.encoder_token_count,
+            max_running_requests,
+        )
+        model.init_encoder_graphs(
+            resolved_buckets,
+            int(self.processor.feature_extractor.nb_max_frames),
+        )
 
     def setup_runtime_resources(self, model: Any, server_args: Any) -> None:
         del server_args
@@ -176,15 +203,20 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
                 model_path=self.checkpoint_dir,
                 feature_extractor=self.processor.feature_extractor,
             ),
+            encoder_token_count=self.encoder_token_count,
             cache_max_entries=self.pre_lm_cache_max_entries,
             cache_max_bytes=self.pre_lm_cache_size_bytes,
             max_batch_size=self.pre_lm_max_batch_size,
             max_batch_wait_ms=self.pre_lm_max_batch_wait_ms,
         )
+        service = self.audio_encoder_service
         logger.info(
-            "Whisper pre-LM encoder enabled "
-            "(max_batch=%d, cache_entries=%d, cache_bytes=%d)",
+            "Whisper pre-LM encoder enabled (max_batch=%d, cache capacity=%d "
+            "entries x %.2f MB = %.2f GB, configured entries=%d, byte cap=%s)",
             self.pre_lm_max_batch_size,
+            service.cache_capacity_entries,
+            service.entry_bytes / 1e6,
+            service.cache_max_bytes / 1e9,
             self.pre_lm_cache_max_entries,
             self.pre_lm_cache_size_bytes,
         )
@@ -204,7 +236,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "disable_overlap_schedule": True,
             "enable_torch_compile": True,
             "mem_fraction_static": self.mem_fraction_static,
-            "max_prefill_tokens": 4096,
+            "max_prefill_tokens": 6144,
             "chunked_prefill_size": 0,
             "sampling_backend": "pytorch",
             "dtype": dtype,
@@ -228,6 +260,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
         return {
+            "enable_async_decode": self.enable_async_decode,
+            "async_decode_min_batch_size": self.async_decode_min_batch_size,
             "request_build_max_workers": self.request_build_max_workers,
             "request_build_max_pending": self.request_build_max_pending,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
