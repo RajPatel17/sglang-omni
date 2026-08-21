@@ -90,6 +90,7 @@ def _make_engine_builder(
         prefill_coalesce_when_idle=True,
         prefill_coalesce_requires_pending_builds=True,
         prefill_coalesce_after_builds_during_decode=True,
+        stream_emit_interval_s=0.05,
     )
     builder.context_length = context_length
     return builder
@@ -197,6 +198,7 @@ def test_qwen3_asr_stage_default_allows_64_running_requests() -> None:
         signature.parameters["prefill_coalesce_after_builds_during_decode"].default
         is True
     )
+    assert signature.parameters["stream_emit_interval_s"].default == 0.05
     assert "request_build_max_backlog" not in signature.parameters
 
 
@@ -289,12 +291,15 @@ def _patch_engine_dependencies(
         attest_calls=[],
         graph_init_calls=[],
         encoder_service=SimpleNamespace(close=lambda: None),
+        tokenizer=object(),
+        stream_output_builder=object(),
+        stream_builder_calls=[],
     )
 
     monkeypatch.setattr(
         qwen3_asr_builder.AutoTokenizer,
         "from_pretrained",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: recorded.tokenizer,
     )
     monkeypatch.setattr(
         qwen3_asr_builder.AutoFeatureExtractor,
@@ -326,6 +331,12 @@ def _patch_engine_dependencies(
         request_builders,
         "make_qwen3_asr_scheduler_adapters",
         lambda **kwargs: (recorded.adapter_kwargs.update(kwargs) or object(), object()),
+    )
+    monkeypatch.setattr(
+        request_builders,
+        "make_qwen3_asr_stream_output_builder",
+        lambda **kwargs: recorded.stream_builder_calls.append(kwargs)
+        or recorded.stream_output_builder,
     )
     monkeypatch.setattr(
         sglang_backend,
@@ -394,6 +405,7 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
             "dummy",
             enable_async_decode=False,
             async_decode_min_batch_size=4,
+            stream_emit_interval_s=0.125,
             server_args_overrides={"context_length": 2048},
         )
 
@@ -424,6 +436,10 @@ def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
     assert scheduler.prefill_coalesce_requires_pending_builds is True
     assert scheduler.prefill_coalesce_after_builds_during_decode is True
     assert scheduler.shutdown_callback is recorded.encoder_service.close
+    assert scheduler.stream_output_builder is recorded.stream_output_builder
+    assert recorded.stream_builder_calls == [
+        {"tokenizer": recorded.tokenizer, "min_emit_interval_s": 0.125}
+    ]
 
 
 @pytest.mark.parametrize(
