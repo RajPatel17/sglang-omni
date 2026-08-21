@@ -252,7 +252,12 @@ Reading, and the resulting defaults:
 
 - **Build workers scale monotonically to 8** at every concurrency ≥ 8 and cost
   nothing at concurrency 1 (0.099–0.101 s mean everywhere), so 8 is the
-  default (it is also what lets the pre-LM encoder form real batches).
+  default. Those workers do CPU request construction (decode audio,
+  optional mel FFT) and submit encoder work asynchronously. When no extra
+  builds are queued, the request builder waits for encode and returns a
+  ready request like the sync path; when pending+backlog exceeds the
+  worker pool, it returns a deferred admission so workers can pull the
+  backlog. A cache hit still skips mel extraction entirely.
 - **Pending 16 → 32 removes all concurrency-64 shedding** and lifts
   concurrency-8 throughput ~19 %; 64 adds nothing further. 32 is the default.
 - **`max_running_requests` 16 collapses concurrency 32** (queue-bound) with no
