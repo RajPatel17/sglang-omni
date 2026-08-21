@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from transformers import AutoFeatureExtractor, AutoTokenizer
@@ -101,6 +101,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
         self.context_length = 0
         self.model_path: str | None = None
         self.audio_encoder_service: Any = None
+        self._should_wait_for_encode: Callable[[], bool] | None = None
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         self.model_path = checkpoint_dir
@@ -220,6 +221,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
                 max_batch_wait_ms=self.pre_lm_max_batch_wait_ms,
             )
 
+    def should_wait_for_encode(self) -> bool:
+        return (
+            False
+            if self._should_wait_for_encode is None
+            else self._should_wait_for_encode()
+        )
+
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
         del model
         return request_builders.make_qwen3_asr_scheduler_adapters(
@@ -228,7 +236,12 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder):
             max_new_tokens=self.max_new_tokens,
             context_length=self.context_length,
             audio_encoder_service=self.audio_encoder_service,
+            should_wait_for_encode=self.should_wait_for_encode,
         )
+
+    def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
+        del model_runner
+        self._should_wait_for_encode = scheduler.request_build_queue_fits_workers
 
     def extra_scheduler_callbacks(self) -> dict[str, Any]:
         if self.audio_encoder_service is None:

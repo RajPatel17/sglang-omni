@@ -96,6 +96,18 @@ def _make_engine_builder(
     return builder
 
 
+def test_qwen3_asr_engine_builder_binds_encode_wait_policy() -> None:
+    builder = _make_engine_builder()
+    assert builder.should_wait_for_encode() is False
+
+    builder.post_scheduler_setup(
+        SimpleNamespace(request_build_queue_fits_workers=lambda: True),
+        object(),
+    )
+
+    assert builder.should_wait_for_encode() is True
+
+
 @pytest.mark.parametrize(
     ("sm_version", "expected_backend"),
     [(89, None), (100, "triton_attn"), (120, "triton_attn")],
@@ -291,6 +303,7 @@ def _patch_engine_dependencies(
         attest_calls=[],
         graph_init_calls=[],
         encoder_service=SimpleNamespace(close=lambda: None),
+        encoder_service_kwargs={},
         tokenizer=object(),
         stream_output_builder=object(),
         stream_builder_calls=[],
@@ -317,10 +330,15 @@ def _patch_engine_dependencies(
         lambda gpu_id: recorded.memory_queries.append(gpu_id) or 0,
     )
     monkeypatch.setattr(qwen3_asr_builder, "init_mm_embedding_cache", lambda size: None)
+
+    def _make_encoder_service(*args, **kwargs):
+        recorded.encoder_service_kwargs.update(kwargs)
+        return recorded.encoder_service
+
     monkeypatch.setattr(
         qwen3_asr_builder,
         "Qwen3ASRPreLMEncoderService",
-        lambda *args, **kwargs: recorded.encoder_service,
+        _make_encoder_service,
     )
     monkeypatch.setattr(
         qwen3_asr_builder,
@@ -351,7 +369,10 @@ def _patch_engine_dependencies(
     monkeypatch.setattr(
         omni_scheduler,
         "OmniScheduler",
-        lambda **kwargs: SimpleNamespace(**kwargs),
+        lambda **kwargs: SimpleNamespace(
+            request_build_queue_fits_workers=lambda: False,
+            **kwargs,
+        ),
     )
     monkeypatch.setattr(
         sglang_backend,
