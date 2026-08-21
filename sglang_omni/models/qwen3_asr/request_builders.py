@@ -33,7 +33,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
+from sglang_omni.scheduling.token_text_streaming import (
+    make_token_text_stream_output_builder,
+)
 from sglang_omni.utils.audio import AudioDecodeError
 
 from . import mrope_fast_path
@@ -415,7 +419,102 @@ def make_qwen3_asr_scheduler_adapters(
     return request_builder, result_adapter
 
 
+def make_qwen3_asr_stream_output_builder(
+    tokenizer: Any,
+    eos_token_id: int | None = None,
+    min_emit_interval_s: float = 0.0,
+) -> Callable[[str, Any, Any], list[OutgoingMessage]]:
+    tokenizer_eos = tokenizer.eos_token_id
+    resolved_eos = (
+        eos_token_id
+        if eos_token_id is not None
+        else (int(tokenizer_eos) if tokenizer_eos is not None else None)
+    )
+    asr_text_token_ids = _encode_literal(tokenizer, _ASR_TEXT)
+    if not asr_text_token_ids:
+        raise ValueError("Qwen3-ASR tokenizer produced no <asr_text> token IDs")
+
+    token_stream_builder = make_token_text_stream_output_builder(
+        decode_fn=lambda ids: _decode_token_ids(
+            tokenizer, ids, skip_special_tokens=True
+        ),
+        build_message_data=lambda delta: {
+            "text": delta,
+            "modality": "text",
+            "stage_name": "asr",
+        },
+        build_message_metadata=lambda token_id: {
+            "modality": "text",
+            "token_id": token_id,
+        },
+        pending_ids_attr="_qwen3_asr_stream_pending_ids",
+        last_emit_attr="_qwen3_asr_stream_last_emit_t",
+        eos_token_id=resolved_eos,
+        min_emit_interval_s=min_emit_interval_s,
+        allow_terminal_flush=True,
+        emit_trailing_replacement_on_terminal=True,
+    )
+
+    def _build_stream_output(
+        request_id: str, req_data: Any, req_output: Any
+    ) -> list[OutgoingMessage]:
+        req = req_data.req
+        if req is None or req.inflight_middle_chunks > 0:
+            return token_stream_builder(request_id, req_data, req_output)
+        stage_payload = req_data.stage_payload
+        if stage_payload is None or not (stage_payload.request.params or {}).get(
+            "stream", False
+        ):
+            return token_stream_builder(request_id, req_data, req_output)
+
+        # note (Xinyu): Auto-language output starts with
+        # language <name><asr_text>; suppress it until the transcript marker.
+        if req_data.language is not None:
+            return token_stream_builder(request_id, req_data, req_output)
+        try:
+            transcript_started = req._qwen3_asr_stream_transcript_started
+        except AttributeError:
+            transcript_started = False
+        if transcript_started:
+            return token_stream_builder(request_id, req_data, req_output)
+
+        token_data = req_output.data
+        if token_data is None:
+            return token_stream_builder(request_id, req_data, req_output)
+        try:
+            token_id = int(token_data)
+        except (TypeError, ValueError):
+            return token_stream_builder(request_id, req_data, req_output)
+        if resolved_eos is not None and token_id == resolved_eos:
+            return token_stream_builder(request_id, req_data, req_output)
+
+        try:
+            matched = int(req._qwen3_asr_stream_marker_match_len)
+        except AttributeError:
+            matched = 0
+        candidate = [*asr_text_token_ids[:matched], token_id]
+        matched = 0
+        for prefix_len in range(min(len(asr_text_token_ids), len(candidate)), 0, -1):
+            if candidate[-prefix_len:] == asr_text_token_ids[:prefix_len]:
+                matched = prefix_len
+                break
+
+        if matched == len(asr_text_token_ids):
+            req._qwen3_asr_stream_transcript_started = True
+            req._qwen3_asr_stream_marker_match_len = 0
+        else:
+            req._qwen3_asr_stream_marker_match_len = matched
+        return []
+
+    def _flush_stream_output(request_id: str, req_data: Any) -> list[OutgoingMessage]:
+        return token_stream_builder.flush(request_id, req_data)  # type: ignore[attr-defined]
+
+    _build_stream_output.flush = _flush_stream_output  # type: ignore[attr-defined]
+    return _build_stream_output
+
+
 __all__ = [
     "Qwen3ASRRequestData",
     "make_qwen3_asr_scheduler_adapters",
+    "make_qwen3_asr_stream_output_builder",
 ]

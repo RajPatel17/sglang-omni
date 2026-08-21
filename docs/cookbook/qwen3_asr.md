@@ -84,6 +84,34 @@ resp.raise_for_status()
 print(resp.json()["text"])
 ```
 
+## Stream Transcription
+
+Set `stream=true` to receive incremental transcript deltas over SSE. Use
+`curl -N` to disable client-side response buffering:
+
+```bash
+curl -N -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F model=Qwen/Qwen3-ASR-1.7B \
+  -F file=@tests/data/query_to_cars.wav \
+  -F language=en \
+  -F response_format=json \
+  -F stream=true
+```
+
+The stream contains zero or more delta events, followed by the complete final
+transcript and the SSE sentinel:
+
+```text
+data: {"type":"transcript.text.delta","delta":"..."}
+
+data: {"type":"transcript.text.done","text":"..."}
+
+data: [DONE]
+```
+
+Qwen3-ASR batches deltas for up to 50 ms by default. EOS and other terminal
+conditions flush any buffered text before the final transcript event.
+
 ## Request Parameters
 
 | Parameter | Type | Default | Description |
@@ -95,7 +123,7 @@ print(resp.json()["text"])
 | `response_format` | string | `json` | `json`, `verbose_json`, or `text` |
 | `temperature` | float | `0` | Sampling temperature; `0` uses greedy decoding |
 | `max_new_tokens` | integer | server stage limit | Per-request generation-token limit |
-| `stream` | boolean | `false` | Return transcript events over SSE |
+| `stream` | boolean | `false` | Return SSE transcript deltas; supports `json` or `text` response format |
 
 `verbose_json` uses the model adapter's verbose response schema and includes
 duration-based usage (rounded-up audio seconds) when duration probing succeeds.
