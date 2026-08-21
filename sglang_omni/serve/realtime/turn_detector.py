@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol
 
@@ -29,14 +30,20 @@ def build_turn_detector(
     requested_type = str(getattr(raw_type, "value", raw_type) or "server_vad")
     if requested_type == "semantic_vad" and smart_turn_model is not None:
         eagerness = str(config.get("eagerness") or "medium")
+        if eagerness == "auto":
+            eagerness = "medium"
         semantic_config = replace(
             SemanticVADConfig.from_eagerness(eagerness),
             speech_threshold=_optional_float(
-                config.get("threshold"), SemanticVADConfig.speech_threshold
+                config.get("threshold"),
+                SemanticVADConfig.speech_threshold,
+                minimum=0.0,
+                maximum=1.0,
             ),
             prefix_padding_ms=_optional_int(
                 config.get("prefix_padding_ms"),
                 SemanticVADConfig.prefix_padding_ms,
+                minimum=0,
             ),
         )
         detector = SemanticTurnDetector(
@@ -50,12 +57,16 @@ def build_turn_detector(
         return TurnDetectorBuild(detector, effective)
 
     server_config = VADConfig(
-        threshold=_optional_float(config.get("threshold"), VADConfig.threshold),
+        threshold=_optional_float(
+            config.get("threshold"), VADConfig.threshold, minimum=0.0, maximum=1.0
+        ),
         prefix_padding_ms=_optional_int(
-            config.get("prefix_padding_ms"), VADConfig.prefix_padding_ms
+            config.get("prefix_padding_ms"), VADConfig.prefix_padding_ms, minimum=0
         ),
         silence_duration_ms=_optional_int(
-            config.get("silence_duration_ms"), VADConfig.silence_duration_ms
+            config.get("silence_duration_ms"),
+            VADConfig.silence_duration_ms,
+            minimum=0,
         ),
     )
     effective = dict(config)
@@ -64,9 +75,29 @@ def build_turn_detector(
     return TurnDetectorBuild(StreamingVAD(server_config), effective)
 
 
-def _optional_float(value: Any, default: float) -> float:
-    return default if value is None else float(value)
+def _optional_float(
+    value: Any,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if value is None:
+        return default
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"Value must be finite, got {value!r}")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"Value must be >= {minimum}, got {result}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"Value must be <= {maximum}, got {result}")
+    return result
 
 
-def _optional_int(value: Any, default: int) -> int:
-    return default if value is None else int(value)
+def _optional_int(value: Any, default: int, *, minimum: int | None = None) -> int:
+    if value is None:
+        return default
+    result = int(value)
+    if minimum is not None and result < minimum:
+        raise ValueError(f"Value must be >= {minimum}, got {result}")
+    return result

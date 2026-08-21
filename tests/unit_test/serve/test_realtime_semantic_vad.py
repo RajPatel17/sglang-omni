@@ -186,6 +186,7 @@ async def test_session_created_advertises_turn_detection_capabilities():
             client=MagicMock(),
             model_name="model",
             session_id="session",
+            smart_turn_model=MagicMock(),
         )
 
     await session.run()

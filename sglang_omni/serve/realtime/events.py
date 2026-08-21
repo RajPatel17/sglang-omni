@@ -30,6 +30,7 @@ class SemanticVADEagerness(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    AUTO = "auto"
 
 
 class TurnDetection(EventBase):

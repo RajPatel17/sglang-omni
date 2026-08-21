@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -118,7 +119,7 @@ def test_resumed_speech_discards_pause_decision():
     assert eou.calls == 2
 
 
-def test_inference_failure_uses_fixed_silence_fallback():
+def test_inference_failure_uses_fixed_silence_fallback(caplog):
     decisions = [True] + [False] * 20
     eou = FakeEOU([RuntimeError("broken model")])
     detector = SemanticTurnDetector(
@@ -127,9 +128,10 @@ def test_inference_failure_uses_fixed_silence_fallback():
         speech_model=FakeSpeechModel(decisions),
     )
 
-    with pytest.warns(RuntimeWarning, match="fixed-silence fallback"):
+    with caplog.at_level(logging.WARNING):
         emits = detector.process(_pcm_frames(len(decisions)))
 
+    assert "fixed-silence fallback" in caplog.text
     assert emits[-1] == Emit(VADEvent.SPEECH_STOPPED, VAD_FRAME_SAMPLES)
     assert eou.calls == 1
 

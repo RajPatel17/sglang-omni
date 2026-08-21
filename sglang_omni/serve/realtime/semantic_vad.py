@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import warnings
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -11,6 +11,8 @@ import torch
 from silero_vad import load_silero_vad
 
 from .vad import VAD_FRAME_SAMPLES, VAD_SAMPLE_RATE, Emit, VADEvent
+
+logger = logging.getLogger(__name__)
 
 
 class SemanticEOUModel(Protocol):
@@ -152,12 +154,10 @@ class SemanticTurnDetector:
             ):
                 try:
                     self.candidate_probability = self._predict_eou()
-                except Exception as exc:
-                    warnings.warn(
-                        f"Smart Turn inference failed; using fixed-silence "
-                        f"fallback: {exc}",
-                        RuntimeWarning,
-                        stacklevel=2,
+                except Exception:
+                    logger.warning(
+                        "Smart Turn inference failed; using fixed-silence fallback",
+                        exc_info=True,
                     )
                     self._eou_broken = True
                     if silence_ms >= self.config.fallback_silence_ms:

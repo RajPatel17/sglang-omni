@@ -24,7 +24,7 @@ from sglang_omni.serve.realtime.events import (
     make_event,
     parse_client_event,
 )
-from sglang_omni.serve.realtime.semantic_vad import SemanticEOUModel
+from sglang_omni.serve.realtime.semantic_vad import SemanticEOUModel, SemanticVADConfig
 from sglang_omni.serve.realtime.turn_detector import TurnDetector, build_turn_detector
 from sglang_omni.serve.realtime.vad import (
     StreamingVAD,
@@ -105,15 +105,14 @@ class RealtimeSession:
         self.supports_audio_output = supports_audio_output
         self.smart_turn_model = smart_turn_model
 
+        turn_detection_capabilities = [TurnDetectionType.SERVER_VAD.value]
+        if smart_turn_model is not None:
+            turn_detection_capabilities.append(TurnDetectionType.SEMANTIC_VAD.value)
+
         self.session_object = SessionObject(
             id=self.session_id,
             model=model_name,
-            capabilities={
-                "turn_detection": [
-                    TurnDetectionType.SERVER_VAD.value,
-                    TurnDetectionType.SEMANTIC_VAD.value,
-                ]
-            },
+            capabilities={"turn_detection": turn_detection_capabilities},
             modalities=["text"],
             instructions=DEFAULT_INSTRUCTIONS,
             input_audio_format="pcm16",
@@ -293,12 +292,51 @@ class RealtimeSession:
 
     @staticmethod
     def _detector_config(value: TurnDetection | None) -> dict[str, Any]:
+        # Resolve against the same runtime defaults build_turn_detector applies,
+        # so a client that merely restates the active default doesn't compare
+        # as "changed" and trigger a needless detector rebuild/buffer clear.
         effective = value or TurnDetection()
-        return effective.model_dump(
-            exclude={"interrupt_response"},
-            exclude_none=True,
-            mode="json",
-        )
+        detection_type = effective.type.value
+        if detection_type == TurnDetectionType.SEMANTIC_VAD.value:
+            eagerness = str(
+                effective.eagerness.value if effective.eagerness is not None else "medium"
+            )
+            if eagerness == "auto":
+                eagerness = "medium"
+            semantic_defaults = SemanticVADConfig.from_eagerness(eagerness)
+            return {
+                "type": detection_type,
+                "eagerness": eagerness,
+                "threshold": (
+                    semantic_defaults.speech_threshold
+                    if effective.threshold is None
+                    else effective.threshold
+                ),
+                "prefix_padding_ms": (
+                    semantic_defaults.prefix_padding_ms
+                    if effective.prefix_padding_ms is None
+                    else effective.prefix_padding_ms
+                ),
+            }
+        vad_defaults = VADConfig()
+        return {
+            "type": detection_type,
+            "threshold": (
+                vad_defaults.threshold
+                if effective.threshold is None
+                else effective.threshold
+            ),
+            "prefix_padding_ms": (
+                vad_defaults.prefix_padding_ms
+                if effective.prefix_padding_ms is None
+                else effective.prefix_padding_ms
+            ),
+            "silence_duration_ms": (
+                vad_defaults.silence_duration_ms
+                if effective.silence_duration_ms is None
+                else effective.silence_duration_ms
+            ),
+        }
 
     @staticmethod
     def _merge_turn_detection(
