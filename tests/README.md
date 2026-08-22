@@ -144,6 +144,7 @@ tests/
     │   ├── test_core.py
     │   └── test_request_builders.py
     ├── qwen3_asr/
+    │   ├── test_encoder_cuda_graph.py
     │   ├── test_pipeline.py
     │   ├── test_request_builders.py
     │   └── test_stream_output_builder.py
@@ -483,6 +484,9 @@ that happened to contain an older version of the test.
     text round-trips for byte-level BPE output.
   - invalid encoded-audio classification versus operational loader failures,
     including transcription-route HTTP 400/500 mapping.
+  - encoder CUDA graph runner: config-derived token buckets, dummy-window
+    padding invariants, get_audio_feature routing with eager fallback, and a
+    CUDA-only graph-vs-eager parity check of the captured layer stack.
 - `unit_test/arkasr/`: ARK-ASR-3B unit tests:
   - asynchronous pre-LM encoder submission, bounded queue backpressure,
     single-flight deduplication, CPU cache validation, and failure recovery
@@ -639,7 +643,10 @@ that happened to contain an older version of the test.
   - preprocessing handoff and abort cleanup behavior
   - delay-pattern runner, codec splitting, and seeded sampling contracts
   - incremental delay-row emission, bounded overlap decode parity, early-done
-    final-tail handling, and streaming abort cleanup.
+    final-tail handling, and streaming abort cleanup
+  - shared MOSS-Audio-Tokenizer transformer and vocoder decoder packing,
+    local-causal FlashAttention window equivalence, CUDA bf16 packed-vs-SDPA
+    parity, zero-length handling, and flash-unavailable fallback.
 
 - `unit_test/moss_tts_local/`: MOSS-TTS Local unit tests:
   - pipeline config, request builders, and scheduler adapter contracts
@@ -648,10 +655,7 @@ that happened to contain an older version of the test.
   - synchronous frame-decode parity harness and S0 gate coverage
   - streaming vocoder session lifecycle, per-request chunk-threshold and
     coalescing contracts, decode-failure isolation, and non-streaming full-sequence
-    decode through the codec path
-  - MOSS-TTS Local vocoder decoder packing, local-causal FlashAttention window
-    equivalence, CUDA bf16 packed-vs-SDPA parity, zero-length handling, and
-    flash-unavailable fallback.
+    decode through the codec path.
 
 - `unit_test/zonos2/`: ZONOS2 unit tests:
   - pipeline configuration, text normalization, and speaker/component caches
