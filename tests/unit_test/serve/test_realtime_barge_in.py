@@ -580,9 +580,7 @@ async def test_new_speech_cancels_dequeued_turn_waiting_for_speech_idle(
         yield _chunk(text="unexpected second request")
         yield _chunk(finish_reason="stop")
 
-    session, _, client = _session(
-        monkeypatch, [first_stream, unexpected_second_stream]
-    )
+    session, _, client = _session(monkeypatch, [first_stream, unexpected_second_stream])
     session.speech_idle.clear()
     await session.response_queue.put(("queued-user-item", "audio"))
     session.queue_drainer = asyncio.create_task(session.drain_queue())

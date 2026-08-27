@@ -551,9 +551,7 @@ class RealtimeSession:
         async def claim_terminal() -> tuple[bool, str | None, asyncio.Event | None]:
             async with self.response_state_lock:
                 cancelled = self.cancelled_response_request_id == request_id
-                cancel_reason = (
-                    self.cancelled_response_reason if cancelled else None
-                )
+                cancel_reason = self.cancelled_response_reason if cancelled else None
                 terminal_gate = (
                     self.cancelled_response_terminal_gate if cancelled else None
                 )
@@ -730,9 +728,7 @@ class RealtimeSession:
                     include_audio=wants_audio and saw_audio,
                     status="cancelled" if cancelled else "failed",
                     reason=(
-                        (cancel_reason or "client_cancelled")
-                        if cancelled
-                        else "error"
+                        (cancel_reason or "client_cancelled") if cancelled else "error"
                     ),
                     error=(
                         None

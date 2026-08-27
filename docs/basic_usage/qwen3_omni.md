@@ -382,14 +382,10 @@ cancelled with reason `turn_detected`; its user transcription still completes
 and enters conversation history before the next queued turn runs. Cancelled
 assistant output is not added to conversation history.
 
-The server marks and aborts the active generation before waiting on the
-outbound `speech_started` WebSocket send. This prevents a slow or backpressured
-client from extending model work after speech has already been detected.
-Automatic `turn_detected` cancellation terminals remain gated behind
-`speech_started`, preserving the documented wire order. Cancellation reasons
-are first-processed-wins: an explicit `response.cancel` processed before VAD
-remains `client_cancelled`; once VAD cancellation is processed, a later
-explicit cancel does not rewrite `turn_detected`.
+The server aborts active generation immediately on speech detection instead of
+waiting on the outbound `speech_started` send, so a slow client can't extend
+model work past an interruption. Cancellation terminals still wait behind
+`speech_started` on the wire.
 
 Clients must stop buffered playback on `speech_started` and reject every later
 `response.audio.delta` for that response until its `response.done`. If speech
