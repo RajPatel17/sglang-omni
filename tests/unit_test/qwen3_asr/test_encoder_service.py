@@ -17,6 +17,16 @@ from sglang_omni.models.qwen3_asr.encoder_service import (
 )
 
 _HIDDEN_SIZE = 4
+if torch.cuda.is_available():
+    _DEVICE = "cuda"
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    _DEVICE = "xpu"
+else:
+    _DEVICE = "cpu"
+requires_accelerator = pytest.mark.skipif(
+    _DEVICE == "cpu",
+    reason="requires cuda or xpu",
+)
 _NAMESPACE = "testns"
 _SERVICES: list[Qwen3ASRPreLMEncoderService] = []
 
@@ -429,16 +439,10 @@ def test_encode_failure_propagates_without_poisoning_cache() -> None:
     assert item.precomputed_embeddings.shape == (3, _HIDDEN_SIZE)
 
 
-def test_oom_failure_detaches_traceback_and_recovers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_oom_failure_detaches_traceback_and_recovers() -> None:
     model = _StubModel()
     model.fail_oom = True
     service = _make_service(model)
-    empty_cache_calls: list[bool] = []
-    monkeypatch.setattr(
-        torch.cuda, "empty_cache", lambda: empty_cache_calls.append(True)
-    )
 
     with pytest.raises(torch.OutOfMemoryError, match="encoder OOM") as excinfo:
         service.encode_item(_item(77, 3))
@@ -659,3 +663,36 @@ def test_flat_2d_encoder_output_is_also_accepted() -> None:
     service.encode_item(item)
 
     assert item.precomputed_embeddings.shape == (3, _HIDDEN_SIZE)
+
+
+@pytest.mark.accelerator
+@requires_accelerator
+def test_the_device_cache_is_really_reclaimed_after_an_oom() -> None:
+    """The behaviour the fix exists for, on the live accelerator."""
+    device_module = torch.get_device_module(torch.device(_DEVICE))
+    service = _make_service(_StubModel().to(_DEVICE))
+
+    with device_module.device(_DEVICE):
+        device_module.synchronize()
+        device_module.empty_cache()
+        floor = device_module.memory_reserved()
+        allocated = device_module.memory_allocated()
+        cached_slack = max(0, floor - allocated)
+        block = torch.empty(
+            cached_slack + 64 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=_DEVICE,
+        )
+        device_module.synchronize()
+        reserved_with_block = device_module.memory_reserved()
+        assert reserved_with_block > floor
+
+        del block
+        device_module.synchronize()
+        reserved_before = device_module.memory_reserved()
+        assert reserved_before > floor
+
+        service._recover_after_failure(torch.OutOfMemoryError("encoder OOM"))
+
+        device_module.synchronize()
+        assert device_module.memory_reserved() < reserved_before
