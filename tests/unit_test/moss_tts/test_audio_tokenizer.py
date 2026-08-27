@@ -714,6 +714,7 @@ def test_query_chunked_sdpa_matches_dense_reference(
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
 
 
+@pytest.mark.accelerator
 def test_query_chunked_sdpa_matches_dense_reference_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -737,6 +738,7 @@ def test_query_chunked_sdpa_matches_dense_reference_cuda() -> None:
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=3e-2)
 
 
+@pytest.mark.accelerator
 def test_auto_backend_runs_query_chunked_sdpa_for_cuda_float32() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -811,6 +813,7 @@ def test_query_chunked_sdpa_handles_empty_and_zero_length_inputs() -> None:
     assert torch.count_nonzero(padded[1]) == 0
 
 
+@pytest.mark.accelerator
 def test_local_causal_attention_keeps_packed_flash_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -1059,6 +1062,7 @@ def test_projected_transformer_single_padded_input_uses_masked_pack() -> None:
     assert torch.equal(out_lengths, lengths)
 
 
+@pytest.mark.accelerator
 def test_sglang_packed_flash_matches_sdpa_reference_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -1096,6 +1100,7 @@ def test_sglang_packed_flash_matches_sdpa_reference_cuda() -> None:
     torch.testing.assert_close(flash_out, sdpa_out, atol=4e-2, rtol=3e-2)
 
 
+@pytest.mark.accelerator
 def test_sglang_local_packed_flash_matches_sdpa_reference_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -1181,6 +1186,7 @@ def test_cached_packed_rope_matches_moss_interleaved_reference() -> None:
     assert cache._cos.data_ptr() == cos_ptr
 
 
+@pytest.mark.accelerator
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_exact_packed_rope_matches_reference_cuda(dtype: torch.dtype) -> None:
     if not torch.cuda.is_available():
@@ -1237,7 +1243,7 @@ def test_transformer_layer_uses_source_modules_for_primitive_ops() -> None:
 def test_vocoder_decoder_wraps_supported_stage_types() -> None:
     patch_stage = _PatchStage(patch_size=2, is_downsample=False)
     decoder = nn.ModuleList([_FallbackProjectedStage(), patch_stage])
-    wrapped = MossAudioTokenizerVocoderDecoder(decoder)
+    wrapped = MossAudioTokenizerVocoderDecoder.from_module(decoder)
 
     assert len(wrapped) == 2
     assert isinstance(wrapped[0], MossAudioTokenizerProjectedTransformer)
@@ -1253,7 +1259,7 @@ def test_vocoder_decoder_computes_output_lengths_on_host() -> None:
             _PatchStage(patch_size=2, is_downsample=True),
         ]
     )
-    wrapped = MossAudioTokenizerVocoderDecoder(decoder)
+    wrapped = MossAudioTokenizerVocoderDecoder.from_module(decoder)
 
     assert wrapped.output_lengths([3, 5]) == [12, 20]
 
@@ -1267,7 +1273,7 @@ def test_vocoder_decoder_requires_packed_attention_for_every_transformer(
         lambda device: None if device.type == "cuda" else "not CUDA",
     )
     moss_audio_tokenizer_v1_source = _MossAudioTokenizerV1ProjectedStage()
-    moss_audio_tokenizer_v1_decoder = MossAudioTokenizerVocoderDecoder(
+    moss_audio_tokenizer_v1_decoder = MossAudioTokenizerVocoderDecoder.from_module(
         nn.ModuleList([moss_audio_tokenizer_v1_source])
     )
     moss_audio_tokenizer_v1_attention = (
@@ -1290,7 +1296,7 @@ def test_vocoder_decoder_requires_packed_attention_for_every_transformer(
     local_source.transformer.layers[0].self_attn.attention_implementation = (
         "flash_attention_2"
     )
-    local = MossAudioTokenizerVocoderDecoder(nn.ModuleList([local_source]))
+    local = MossAudioTokenizerVocoderDecoder.from_module(nn.ModuleList([local_source]))
     local_attention = local[0].transformer.layers[0].self_attn
     local_attention._flash_attn_varlen = lambda *args, **kwargs: None
 
@@ -1300,7 +1306,7 @@ def test_vocoder_decoder_requires_packed_attention_for_every_transformer(
 
 def test_vocoder_decoder_wraps_moss_audio_tokenizer_v1_weight_fields() -> None:
     source = _MossAudioTokenizerV1ProjectedStage()
-    wrapped = MossAudioTokenizerVocoderDecoder(nn.ModuleList([source]))
+    wrapped = MossAudioTokenizerVocoderDecoder.from_module(nn.ModuleList([source]))
     source_layer = source.transformer.layers[0]
     wrapped_layer = wrapped[0].transformer.layers[0]
     attention = wrapped_layer.self_attn
