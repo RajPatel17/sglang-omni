@@ -156,6 +156,7 @@ tests/
     │   ├── test_stream_output_builder.py
     │   └── test_streaming_client.py
     ├── arkasr/
+    │   ├── test_encoder_cuda_graph.py
     │   ├── test_encoder_service.py
     │   └── test_pipeline.py
     ├── moss_transcribe_diarize/
@@ -506,8 +507,13 @@ that happened to contain an older version of the test.
 - `unit_test/arkasr/`: ARK-ASR-3B unit tests:
   - asynchronous pre-LM encoder submission, bounded queue backpressure,
     single-flight deduplication, CPU cache validation, and failure recovery
-  - pipeline config, stage factory concurrency defaults, deferred CUDA-graph
-    capture, async-decode default, and the dotted `factory.enable_async_decode` CLI override
+  - pipeline config, stage factory concurrency defaults, encoder CUDA-graph
+    working-set precapture, async-decode default, and the dotted `factory.enable_async_decode` CLI override
+  - encoder CUDA graph runner: 2-D `(batch, T)` buckets aligned to
+    `merge_factor`, batch buckets derived from `encoder_max_batch_size`,
+    startup working-set precapture (no request-path capture), eager
+    fallback for uncaptured shapes, and a CUDA-only graph-vs-eager
+    parity check
   - audio-token count formula, audio-tower forward shape, marker-token
     suppression, and the fp16 encoder residual clamp.
 - `unit_test/fun_asr/`: Fun-ASR-Nano unit tests:

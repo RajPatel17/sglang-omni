@@ -1332,6 +1332,12 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         "_load_qwen3_tts_tokenizer",
         lambda *args, **kwargs: FakeTokenizer(),
     )
+    warmed_schedulers: list[Qwen3TTSStreamingVocoderScheduler] = []
+    monkeypatch.setattr(
+        Qwen3TTSStreamingVocoderScheduler,
+        "warmup_now",
+        lambda scheduler: warmed_schedulers.append(scheduler),
+    )
 
     scheduler = stages.create_vocoder_executor(
         "model",
@@ -1339,6 +1345,7 @@ def test_qwen3_tts_vocoder_batches_decode_requests(
         max_batch_size=2,
         max_batch_wait_ms=3,
     )
+    assert warmed_schedulers == [scheduler]
     assert scheduler.create_stream_state("request").initial_chunk_frames == 8
     assert scheduler._stream_left_context_frames == 16
     assert scheduler._stream_followup_stride == 8
@@ -1606,6 +1613,34 @@ def test_qwen3_tts_streaming_vocoder_followup_graphs_can_be_disabled() -> None:
 
     assert scheduler._followup_decode_graphs._enabled is False
     assert scheduler._initial_decode_graphs is not scheduler._followup_decode_graphs
+
+
+def test_qwen3_tts_vocoder_warms_graphs_before_serving_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+    )
+    captures: list[str] = []
+    monkeypatch.setattr(
+        scheduler._initial_decode_graphs,
+        "capture",
+        lambda: captures.append("initial"),
+    )
+    monkeypatch.setattr(
+        scheduler._followup_decode_graphs,
+        "capture",
+        lambda: captures.append("followup"),
+    )
+
+    scheduler.warmup_now()
+    scheduler.on_serving_start()
+    try:
+        assert captures == ["initial", "followup"]
+    finally:
+        scheduler.stop()
 
 
 def test_qwen3_tts_deterministic_streaming_vocoder_decodes_each_plan_at_b1() -> None:
@@ -3452,22 +3487,56 @@ def _build_qwen3_tts_sglang_request(monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def test_qwen3_tts_request_lifetime_extra_key_is_unique_and_survives_retract(
+def test_qwen3_tts_prompt_key_and_tail_guard_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from sglang_omni.scheduling import omni_scheduler as scheduler_module
+
     first = _build_qwen3_tts_sglang_request(monkeypatch)
     second = _build_qwen3_tts_sglang_request(monkeypatch)
 
     assert first.req.rid == second.req.rid
-    assert first.req.extra_key
-    assert second.req.extra_key
-    assert first.req.extra_key.startswith("qwen3_tts:")
-    assert second.req.extra_key.startswith("qwen3_tts:")
-    assert first.req.extra_key != second.req.extra_key
+    assert list(first.req.origin_input_ids) == list(second.req.origin_input_ids)
+    assert first.req.extra_key == second.req.extra_key == "qwen3_tts:prompt:v1"
+    assert first.req._omni_prompt_cache_key == second.req._omni_prompt_cache_key
 
-    kept = first.req.extra_key
+    seen = []
+    emit = iter([False, True, True])
+
+    def process_result(_, batch, __):
+        seen.append(
+            [getattr(req, "skip_radix_cache_insert", False) for req in batch.reqs]
+        )
+        if next(emit):
+            for req in batch.reqs:
+                req.output_ids.append(7)
+
+    monkeypatch.setattr(
+        scheduler_module._Upstream, "process_batch_result", process_result
+    )
+    scheduler = object.__new__(OmniScheduler)
+    plain = SimpleNamespace(output_ids=[])
+    batch = SimpleNamespace(reqs=[first.req, second.req, plain])
+    scheduler.process_batch_result(batch, None)
+    assert seen == [[False, False, False]]
+    assert not any(getattr(req, "skip_radix_cache_insert", False) for req in batch.reqs)
+    scheduler.process_batch_result(batch, None)
+    assert [getattr(req, "skip_radix_cache_insert", False) for req in batch.reqs] == [
+        True,
+        True,
+        False,
+    ]
+    scheduler.process_batch_result(batch, None)
+
+    assert seen == [
+        [False, False, False],
+        [False, False, False],
+        [True, True, False],
+    ]
+
     first.req.reset_for_retract()
-    assert first.req.extra_key == kept
+    assert first.req.extra_key == "qwen3_tts:prompt:v1"
+    assert first.req.skip_radix_cache_insert
 
 
 def test_qwen3_tts_prepared_payload_missing_state_fails_without_rebuild(
