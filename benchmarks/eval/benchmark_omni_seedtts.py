@@ -193,7 +193,7 @@ class OmniSeedttsBenchmarkConfig:
     max_samples: int | None = None
     max_new_tokens: int = 256
     temperature: float = 0.7
-    warmup: int = 1
+    warmup: int | None = None
     max_concurrency: int = DEFAULT_TTS_BENCHMARK_CONCURRENCY
     request_rate: float = float("inf")
     disable_tqdm: bool = False
@@ -208,6 +208,15 @@ class OmniSeedttsBenchmarkConfig:
     # were not fine-tuned to robustly interpret "please read aloud" as a
     # verbatim-TTS command (e.g. Ming-Omni).
     system_prompt: str | None = None
+
+
+def _resolve_warmup(config: OmniSeedttsBenchmarkConfig) -> int:
+    # note (luojiaxuan): warmup=None means match the benchmark concurrency, so
+    # the timed cohort is not the first to absorb concurrency-shaped cold work.
+    # An explicit --warmup always wins, including 0 and 1.
+    if config.warmup is not None:
+        return config.warmup
+    return config.max_concurrency if config.max_concurrency > 0 else 1
 
 
 def _build_results_config(
@@ -225,7 +234,7 @@ def _build_results_config(
         "speaker": config.speaker,
         "max_samples": config.max_samples,
         "max_new_tokens": config.max_new_tokens,
-        "warmup": config.warmup,
+        "warmup": _resolve_warmup(config),
         "max_concurrency": config.max_concurrency,
         "request_rate": config.request_rate,
     }
@@ -350,7 +359,7 @@ async def run_omni_seedtts_benchmark(
         RunConfig(
             max_concurrency=config.max_concurrency,
             request_rate=config.request_rate,
-            warmup=config.warmup,
+            warmup=_resolve_warmup(config),
             disable_tqdm=config.disable_tqdm,
         )
     )
@@ -500,7 +509,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use streaming chat completions and concatenate audio chunks.",
     )
-    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Warmup requests; defaults to the configured concurrency.",
+    )
     parser.add_argument(
         "--max-concurrency",
         type=int,

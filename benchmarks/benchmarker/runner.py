@@ -75,10 +75,27 @@ class BenchmarkRunner:
         samples: list,
         send_fn: SendFn,
     ) -> None:
-        count = min(self.config.warmup, len(samples))
+        count = self.config.warmup if samples else 0
         logger.info("Warmup (%d requests)...", count)
-        for i in range(count):
-            result = await send_fn(session, samples[i])
+        semaphore = (
+            asyncio.Semaphore(self.config.max_concurrency)
+            if self.config.max_concurrency
+            else None
+        )
+
+        async def _limited(sample: Any) -> RequestResult:
+            if semaphore is None:
+                return await send_fn(session, sample)
+            async with semaphore:
+                return await send_fn(session, sample)
+
+        # note (luojiaxuan): The measured cohort reuses this same sample list,
+        # so warming distinct samples would pre-fill per-sample server caches,
+        # such as the MOSS-TTS reference-audio cache, for requests that are
+        # about to be timed. Repeat one sample to get the concurrency shape
+        # without widening that bias as concurrency grows.
+        results = await asyncio.gather(*(_limited(samples[0]) for _ in range(count)))
+        for i, result in enumerate(results):
             status = "ok" if result.is_success else result.error
             logger.info("  warmup %d/%d: %s", i + 1, count, status)
 

@@ -162,7 +162,7 @@ class TtsSeedttsBenchmarkConfig:
     top_k: int | None = None
     repetition_penalty: float | None = None
     seed: int | None = None
-    warmup: int = 1
+    warmup: int | None = None
     concurrency: int = DEFAULT_TTS_BENCHMARK_CONCURRENCY
     request_rate: float = float("inf")
     stream: bool = False
@@ -208,6 +208,15 @@ def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
     return generation_kwargs
 
 
+def _resolve_warmup(config: TtsSeedttsBenchmarkConfig) -> int:
+    # note (luojiaxuan): warmup=None means match the benchmark concurrency, so
+    # the timed cohort is not the first to absorb concurrency-shaped cold work.
+    # An explicit --warmup always wins, including 0 and 1.
+    if config.warmup is not None:
+        return config.warmup
+    return config.concurrency if config.concurrency > 0 else 1
+
+
 def _build_results_config(
     config: TtsSeedttsBenchmarkConfig,
     *,
@@ -230,7 +239,7 @@ def _build_results_config(
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
         "token_count": config.token_count,
-        "warmup": config.warmup,
+        "warmup": _resolve_warmup(config),
         "concurrency": config.concurrency,
         "request_rate": config.request_rate,
         "initial_codec_chunk_frames": config.initial_codec_chunk_frames,
@@ -302,7 +311,7 @@ async def run_tts_seedtts_benchmark(
         RunConfig(
             max_concurrency=config.concurrency,
             request_rate=config.request_rate,
-            warmup=config.warmup,
+            warmup=_resolve_warmup(config),
             disable_tqdm=config.disable_tqdm,
         )
     )
@@ -556,6 +565,7 @@ async def run_tts_concurrency_sweep(
         failed = int(summary.get("failed_requests") or 0)
         row = {
             "concurrency": concurrency,
+            "warmup": _resolve_warmup(point),
             "output_dir": point_output_dir,
             "success": success,
             "failed": failed,
@@ -749,7 +759,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-request sampler seed for reproducible generation.",
     )
-    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Warmup requests; defaults to the configured concurrency.",
+    )
     parser.add_argument(
         "--concurrency",
         "--max-concurrency",
