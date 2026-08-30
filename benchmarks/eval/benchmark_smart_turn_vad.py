@@ -321,6 +321,37 @@ def load_pcm16(wav_path: Path) -> bytes:
         return w.readframes(w.getnframes())
 
 
+def trim_trailing_silence(
+    pcm: bytes, *, threshold: float = 0.5, pad_frames: int = 3
+) -> bytes:
+    """Trim ``pcm`` to end shortly after the last Silero-detected speech frame.
+
+    Source WAV fixtures often have their own trailing silence baked in. Left
+    untrimmed, the detector can decide the turn is over mid-clip, before the
+    benchmark starts watching for ``SPEECH_STOPPED`` -- silently invalidating
+    the latency measurement. This makes "end of fed audio" line up with the
+    real acoustic end of speech, independent of the detector under test.
+    """
+    import numpy as np
+
+    from sglang_omni.serve.realtime.semantic_vad import SileroSpeechModel
+    from sglang_omni.serve.realtime.vad import VAD_FRAME_SAMPLES
+
+    probe = SileroSpeechModel()
+    frame_bytes = VAD_FRAME_SAMPLES * 2
+    last_speech_frame = -1
+    n_frames = len(pcm) // frame_bytes
+    for i in range(n_frames):
+        chunk = pcm[i * frame_bytes : (i + 1) * frame_bytes]
+        frame = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / 32768.0
+        if probe.predict(frame, VAD_SAMPLE_RATE) >= threshold:
+            last_speech_frame = i
+    if last_speech_frame < 0:
+        raise ValueError("no speech detected in source WAV; pick a different fixture")
+    end_frame = min(n_frames, last_speech_frame + 1 + pad_frames)
+    return pcm[: end_frame * frame_bytes]
+
+
 def chunk_audio(pcm: bytes, chunk_ms: int = CHUNK_MS) -> list[bytes]:
     chunk_bytes = int(VAD_SAMPLE_RATE * chunk_ms / 1000) * 2
     return [pcm[i : i + chunk_bytes] for i in range(0, len(pcm), chunk_bytes)] or [b""]
@@ -422,7 +453,12 @@ async def _inprocess_session(
                 break
             await asyncio.sleep(CHUNK_MS / 1000)
         detector.reset()
-        completed += 1
+        if stopped:
+            completed += 1
+        else:
+            logger.warning(
+                "turn never reached SPEECH_STOPPED within trailing silence window"
+            )
         await asyncio.sleep(0.05)
     return completed
 
@@ -442,7 +478,7 @@ async def _run_inprocess(args: argparse.Namespace) -> BenchmarkSummary:
         )
         return build.detector
 
-    pcm = load_pcm16(args.wav)
+    pcm = trim_trailing_silence(load_pcm16(args.wav))
     wav_chunks = chunk_audio(pcm)
     silence = silence_chunks(TRAILING_SILENCE_S)
 
@@ -599,7 +635,7 @@ async def _server_generating_session(
 
 
 async def _run_server(args: argparse.Namespace) -> BenchmarkSummary:
-    pcm = load_pcm16(args.wav)
+    pcm = trim_trailing_silence(load_pcm16(args.wav))
     wav_chunks = chunk_audio(pcm)
     silence = silence_chunks(TRAILING_SILENCE_S)
 
