@@ -88,7 +88,7 @@ node --test playground/qwen-omni/realtime/playback.test.js
   low-confidence pauses use the 2-second hard stop.
 - Set `SGLANG_OMNI_SMART_TURN_MODEL_PATH` to a local BSD-2 licensed
   [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3)
-  `smart-turn-v3.2-cpu.onnx` file or its containing directory before server
+  `smart-turn-v3.2-gpu.onnx` file or its containing directory before server
   startup. The runtime never downloads the model and verifies its SHA-256.
 - The page constructs its own `AudioWorklet` inline so there's no build
   step / package.json required.

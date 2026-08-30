@@ -377,14 +377,14 @@ detection auto-commits each utterance and starts generation. Check
 `semantic_vad` — older servers only support `server_vad`.
 
 `server_vad` (default) ends a turn after a fixed silence duration.
-`semantic_vad` adds a CPU Smart Turn v3.2 model on top of Silero speech
+`semantic_vad` adds a GPU Smart Turn v3.2 model on top of Silero speech
 detection, so a natural mid-thought pause doesn't end the turn early.
 `eagerness` (`low`/`medium`/`high`, default `medium`) trades latency for
 patience; `silence_duration_ms` only applies to `server_vad`.
 
 To enable `semantic_vad`, provision the BSD-2 licensed
 [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3)
-`smart-turn-v3.2-cpu.onnx` model and set `SGLANG_OMNI_SMART_TURN_MODEL_PATH`
+`smart-turn-v3.2-gpu.onnx` model and set `SGLANG_OMNI_SMART_TURN_MODEL_PATH`
 to its path (file or containing directory). The server never downloads it and
 verifies its SHA-256 on load. If the model is missing or invalid, the
 endpoint still works — semantic requests just fall back to `server_vad`.

@@ -15,9 +15,9 @@ from transformers import WhisperFeatureExtractor
 from .semantic_vad import SemanticEOUModel
 
 SMART_TURN_MODEL_ENV = "SGLANG_OMNI_SMART_TURN_MODEL_PATH"
-SMART_TURN_MODEL_FILENAME = "smart-turn-v3.2-cpu.onnx"
+SMART_TURN_MODEL_FILENAME = "smart-turn-v3.2-gpu.onnx"
 SMART_TURN_MODEL_SHA256 = (
-    "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f"
+    "ab8dc64b88713f90b571c15b714bd1330e6c883cad8763dacf65c9376dc539be"
 )
 
 
@@ -100,7 +100,7 @@ def _load_model(model_path: Path) -> Any:
     session = ort.InferenceSession(
         str(model_path),
         sess_options=options,
-        providers=["CPUExecutionProvider"],
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
     inputs = session.get_inputs()
     if len(inputs) != 1 or inputs[0].name != "input_features":
