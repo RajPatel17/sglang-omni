@@ -299,7 +299,9 @@ class RealtimeSession:
         detection_type = effective.type.value
         if detection_type == TurnDetectionType.SEMANTIC_VAD.value:
             eagerness = str(
-                effective.eagerness.value if effective.eagerness is not None else "medium"
+                effective.eagerness.value
+                if effective.eagerness is not None
+                else "medium"
             )
             if eagerness == "auto":
                 eagerness = "medium"
