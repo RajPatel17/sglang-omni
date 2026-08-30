@@ -539,9 +539,12 @@ class RealtimeSession:
         async def emit_terminals_safely(
             *, terminal_gate: asyncio.Event | None = None, **kwargs: Any
         ) -> None:
-            if terminal_gate is not None:
-                await terminal_gate.wait()
-            terminal_task = asyncio.create_task(emit_terminals(**kwargs))
+            async def _gated_emit_terminals() -> None:
+                if terminal_gate is not None:
+                    await terminal_gate.wait()
+                await emit_terminals(**kwargs)
+
+            terminal_task = asyncio.create_task(_gated_emit_terminals())
             try:
                 await asyncio.shield(terminal_task)
             except asyncio.CancelledError:
