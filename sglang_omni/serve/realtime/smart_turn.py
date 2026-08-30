@@ -15,9 +15,18 @@ from transformers import WhisperFeatureExtractor
 from .semantic_vad import SemanticEOUModel
 
 SMART_TURN_MODEL_ENV = "SGLANG_OMNI_SMART_TURN_MODEL_PATH"
+SMART_TURN_DEVICE_ENV = "SGLANG_OMNI_SMART_TURN_DEVICE"
+
 SMART_TURN_MODEL_FILENAME = "smart-turn-v3.2-cpu.onnx"
 SMART_TURN_MODEL_SHA256 = (
     "2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f"
+)
+
+# FP32 variant sized for CUDAExecutionProvider; benchmark-only alternative to
+# the default INT8 CPU model, selected via SMART_TURN_DEVICE_ENV=cuda.
+SMART_TURN_GPU_MODEL_FILENAME = "smart-turn-v3.2-gpu.onnx"
+SMART_TURN_GPU_MODEL_SHA256 = (
+    "ab8dc64b88713f90b571c15b714bd1330e6c883cad8763dacf65c9376dc539be"
 )
 
 
@@ -27,10 +36,15 @@ class SmartTurnEOU(SemanticEOUModel):
     feature_extractor: WhisperFeatureExtractor
 
     @classmethod
-    def load(cls, model_path: Path | str) -> SmartTurnEOU:
-        resolved_path = _resolve_model_path(model_path)
-        _verify_checksum(resolved_path)
-        session = _load_model(resolved_path)
+    def load(cls, model_path: Path | str, *, device: str = "cpu") -> SmartTurnEOU:
+        filename, expected_sha256 = (
+            (SMART_TURN_GPU_MODEL_FILENAME, SMART_TURN_GPU_MODEL_SHA256)
+            if device == "cuda"
+            else (SMART_TURN_MODEL_FILENAME, SMART_TURN_MODEL_SHA256)
+        )
+        resolved_path = _resolve_model_path(model_path, filename)
+        _verify_checksum(resolved_path, expected_sha256)
+        session = _load_model(resolved_path, device=device)
         feature_extractor = WhisperFeatureExtractor(chunk_length=8)
         return cls(session=session, feature_extractor=feature_extractor)
 
@@ -65,42 +79,48 @@ def load_smart_turn() -> SmartTurnEOU | None:
     configured_path = os.getenv(SMART_TURN_MODEL_ENV)
     if not configured_path:
         return None
-    return SmartTurnEOU.load(configured_path)
+    device = os.getenv(SMART_TURN_DEVICE_ENV, "cpu")
+    return SmartTurnEOU.load(configured_path, device=device)
 
 
-def _resolve_model_path(model_path: Path | str) -> Path:
+def _resolve_model_path(model_path: Path | str, filename: str) -> Path:
     path = Path(model_path).expanduser()
     if path.is_dir():
-        path = path / SMART_TURN_MODEL_FILENAME
+        path = path / filename
     if not path.is_file():
         raise FileNotFoundError(f"Smart Turn model not found at {path}")
     return path
 
 
-def _verify_checksum(path: Path) -> None:
+def _verify_checksum(path: Path, expected_sha256: str) -> None:
     digest = hashlib.sha256()
     with path.open("rb") as model_file:
         for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
             digest.update(chunk)
     actual = digest.hexdigest()
-    if actual != SMART_TURN_MODEL_SHA256:
+    if actual != expected_sha256:
         raise ValueError(
             f"Smart Turn checksum mismatch for {path}: expected "
-            f"{SMART_TURN_MODEL_SHA256}, got {actual}"
+            f"{expected_sha256}, got {actual}"
         )
 
 
-def _load_model(model_path: Path) -> Any:
+def _load_model(model_path: Path, *, device: str = "cpu") -> Any:
     import onnxruntime as ort
 
     options = ort.SessionOptions()
     options.inter_op_num_threads = 1
     options.intra_op_num_threads = 1
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if device == "cuda"
+        else ["CPUExecutionProvider"]
+    )
     session = ort.InferenceSession(
         str(model_path),
         sess_options=options,
-        providers=["CPUExecutionProvider"],
+        providers=providers,
     )
     inputs = session.get_inputs()
     if len(inputs) != 1 or inputs[0].name != "input_features":
