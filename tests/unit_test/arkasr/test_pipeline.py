@@ -59,6 +59,7 @@ def test_arkasr_config_registered():
     assert config.stages[0].name == "asr"
     assert config.stages[0].terminal
     assert config.stages[0].factory.encoder_max_batch_size == 8
+    assert config.stages[0].factory.enable_encoder_cuda_graph is True
     assert config.stages[0].factory.prefill_coalesce_requests == 16
     assert config.stages[0].factory.prefill_coalesce_wait_ms == 32
     assert config.stages[0].factory.prefill_coalesce_when_idle is True
@@ -89,6 +90,7 @@ def test_arkasr_stage_defaults():
     assert signature.parameters["pre_lm_max_batch_size"].default == 8
     assert signature.parameters["pre_lm_max_batch_wait_ms"].default == 0
     assert signature.parameters["pre_lm_max_pending"].default == 32
+    assert signature.parameters["enable_encoder_cuda_graph"].default is False
 
 
 def test_arkasr_pre_lm_group_matches_one_encoder_microbatch_by_default():
@@ -115,6 +117,7 @@ def test_arkasr_pre_lm_encoder_knobs_are_stage_configurable():
     assert factory.pre_lm_max_batch_size == 8
     assert factory.pre_lm_max_batch_wait_ms == 0
     assert factory.pre_lm_max_pending == 32
+    assert factory.enable_encoder_cuda_graph is True
 
 
 def test_arkasr_rejects_invalid_pre_lm_batch_size():
@@ -416,6 +419,7 @@ def _tiny_ark_audio_mm_model() -> ArkasrForConditionalGeneration:
     nn.Module.__init__(model)
     model.audio_encoder = ArkAudioMLPAdapter(_tiny_config()).eval()
     model.encoder_max_batch_size = model.DEFAULT_ENCODER_MAX_BATCH_SIZE
+    model.encoder_cuda_graph_runner = None
     return model
 
 
