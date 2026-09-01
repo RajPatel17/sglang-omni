@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar
+from dataclasses import dataclass
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -357,39 +358,32 @@ class EngineStageConfig(StageConfig):
 
 
 class AudioChunkingConfig(BaseModel):
-    """Per-model long-audio policy for the transcription endpoint.
+    """Operator-tunable scheduling policy for long-audio transcription.
 
-    Each ASR model declares the longest clip it can take in one request; anything
-    longer gets split into non-overlapping chunks. Models may opt into ordered
-    previous-text conditioning; otherwise chunks are transcribed independently.
+    These are the knobs a deployment may set (YAML or dotted CLI overrides).
+    The model-owned side of the contract -- whether chunking is allowed at
+    all, the native clip limit, the tail floor -- lives on PipelineConfig
+    ClassVars, out of reach of configuration.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # Some models can't correctly transcribe an isolated chunk (e.g. diarization needs to track speakers across the whole
-    # recording), so we leave the default value of `allow_audio_chunking` = False.
-    allow_audio_chunking: bool = False
     # Note (Jeffro): Longest clip (chunk length) sent to the engine in one request.
     # Must stay within what the model's context can hold (Qwen3-ASR sizes its
     # context for the official 1,200s native limit); below that ceiling it
     # is a scheduling trade-off: shorter chunks batch better and keep a
     # long upload from monopolizing the engine, at the cost of more seams.
-    max_audio_clip_s: float = Field(default=60.0, gt=0)
+    max_audio_clip_s: float = Field(default=30.0, gt=0)
 
-    max_native_clip_s: float | None = Field(default=None, gt=0)
-
+    # Memory guard for the whole upload: the decoded waveform stays resident
+    # while its chunks run.
     max_total_audio_s: float | None = Field(default=3600.0, gt=0)
-
-    # Shortest final chunk worth transcribing.
-    min_tail_s: float = Field(default=0.5, ge=0)
 
     # Note (Jeffro): How many chunks of one HTTP request may run in the engine at once.
     # This is a fairness cap: to avoid a single long
     # upload grabs every batch slot and queues out everyone else's requests.
     # This is a pre-request cap.
     max_concurrent_chunks: int = Field(default=8, ge=1)
-
-    condition_on_previous_text: bool = False
 
     def model_post_init(self, __context: Any = None) -> None:
         if (
@@ -400,14 +394,26 @@ class AudioChunkingConfig(BaseModel):
                 f"max_total_audio_s={self.max_total_audio_s} must be at least "
                 f"max_audio_clip_s={self.max_audio_clip_s}"
             )
-        if (
-            self.max_native_clip_s is not None
-            and self.max_native_clip_s < self.max_audio_clip_s
-        ):
-            raise ValueError(
-                f"max_native_clip_s={self.max_native_clip_s} must be at least "
-                f"max_audio_clip_s={self.max_audio_clip_s}"
-            )
+
+
+@dataclass(frozen=True)
+class ResolvedAudioChunking:
+    """The merged long-audio contract the transcription handlers consume.
+
+    Built by PipelineConfig.resolved_audio_chunking from the model's ClassVars and the operator policy.
+    """
+
+    allow_audio_chunking: bool = False
+    max_audio_clip_s: float = 30.0
+    max_native_clip_s: float | None = None
+    max_total_audio_s: float | None = 3600.0
+    min_tail_s: float = 0.5
+    max_concurrent_chunks: int = 8
+    condition_on_previous_text: bool = False
+
+    @classmethod
+    def disabled(cls) -> "ResolvedAudioChunking":
+        return cls()
 
     @property
     def stream_clip_limit_s(self) -> float:
@@ -440,7 +446,19 @@ class PipelineConfig(BaseModel):
     speech_reference_text_required: ClassVar[bool] = False
     speech_reference_text_excludes_instructions: ClassVar[bool] = False
     additional_speech_languages: ClassVar[frozenset[str]] = frozenset()
-    audio_chunking: ClassVar[AudioChunkingConfig] = AudioChunkingConfig()
+
+    # Note (Jeffro): the model-owned parameters of the long-audio transcription
+    # contract. Chunking stays off by default: some models can't correctly
+    # transcribe an isolated chunk (e.g. diarization tracks speakers across the
+    # whole recording).
+    allow_audio_chunking: ClassVar[bool] = (
+        False  # Whether the model can correctly transcribe an isolated chunk.
+    )
+    max_native_clip_s: ClassVar[float | None] = None
+    min_tail_s: ClassVar[float] = 0.5  # Shortest final chunk worth transcribing.
+    condition_on_previous_text: ClassVar[bool] = (
+        False  # Whether the model can condition on the previous text.
+    )
 
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {}
     """Stage name -> ``StageConfig`` subclass for this pipeline's stage types.
@@ -454,11 +472,13 @@ class PipelineConfig(BaseModel):
     """
 
     model_path: str
+    audio_chunking: AudioChunkingConfig = Field(default_factory=AudioChunkingConfig)
     stages: list[StageConfig]
     name: str | None = None
     entry_stage: str | None = None
     processes: dict[str, ProcessConfig] = Field(default_factory=dict)
     env_defaults: dict[str, str] = Field(default_factory=dict)
+    mps: Literal["off", "on", "auto"] = "off"
     placement: PlacementConfig = Field(default_factory=PlacementConfig)
     placement_policy: str | None = None
     endpoints: EndpointsConfig = Field(default_factory=EndpointsConfig)
@@ -500,9 +520,39 @@ class PipelineConfig(BaseModel):
     def model_post_init(self, __context: Any = None) -> None:
         self._validate_general()
         self._validate_processes()
+
+        native = type(self).max_native_clip_s
+        if native is not None and self.audio_chunking.max_audio_clip_s > native:
+            raise ValueError(
+                f"audio_chunking.max_audio_clip_s="
+                f"{self.audio_chunking.max_audio_clip_s:g} must not exceed "
+                f"the model's native clip limit ({native:g}s)"
+            )
+
+        if self.audio_chunking.max_audio_clip_s < type(self).min_tail_s:
+            raise ValueError(
+                f"audio_chunking.max_audio_clip_s="
+                f"{self.audio_chunking.max_audio_clip_s:g} must be at least "
+                f"the model's minimum useful clip length "
+                f"({type(self).min_tail_s:g}s)"
+            )
         self.config_cls = self.__class__.__name__
         if self.name is None:
             self.name = self.model_path
+
+    @property
+    def resolved_audio_chunking(self) -> ResolvedAudioChunking:
+        """The merged long-audio contract: model ClassVars + operator policy."""
+        cls = type(self)
+        return ResolvedAudioChunking(
+            allow_audio_chunking=cls.allow_audio_chunking,
+            max_audio_clip_s=self.audio_chunking.max_audio_clip_s,
+            max_native_clip_s=cls.max_native_clip_s,
+            max_total_audio_s=self.audio_chunking.max_total_audio_s,
+            min_tail_s=cls.min_tail_s,
+            max_concurrent_chunks=self.audio_chunking.max_concurrent_chunks,
+            condition_on_previous_text=cls.condition_on_previous_text,
+        )
 
     @classmethod
     def stage_config_cls(cls, stage_name: str) -> type[StageConfig]:

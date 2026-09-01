@@ -1526,13 +1526,16 @@ def _chunking_test_client(
     max_native_clip_s: float | None = None,
     architectures: list[str] | None = None,
 ) -> TestClient:
-    from sglang_omni.config import AudioChunkingConfig
+    from sglang_omni.config import ResolvedAudioChunking
 
-    policy = AudioChunkingConfig(
+    policy = ResolvedAudioChunking(
         allow_audio_chunking=True,
         max_audio_clip_s=1.0,
-        max_total_audio_s=max_total_audio_s,
         max_native_clip_s=max_native_clip_s,
+        max_total_audio_s=max_total_audio_s,
+        min_tail_s=0.5,
+        max_concurrent_chunks=8,
+        condition_on_previous_text=False,
     )
     return TestClient(
         create_app(
@@ -1720,6 +1723,25 @@ def test_streamed_audio_beyond_the_native_limit_is_rejected() -> None:
 
     assert response.status_code == 400
     assert "2 seconds" in response.json()["detail"]
+    assert transcription_client.requests == []
+
+
+def test_streamed_audio_beyond_total_limit_requests_shorter_file() -> None:
+    transcription_client = ChunkRecordingTranscriptionClient()
+    client = _chunking_test_client(
+        transcription_client,
+        max_total_audio_s=2.0,
+        max_native_clip_s=2.0,
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        data={"model": "asr", "stream": "true"},
+        files={"file": ("long.wav", _wav_upload(2.5), "audio/wav")},
+    )
+
+    assert response.status_code == 400
+    assert "use a shorter audio file" in response.json()["detail"]
     assert transcription_client.requests == []
 
 

@@ -1856,6 +1856,7 @@ def test_moss_text_control_logits_select_from_full_processor_output() -> None:
     audio_logits = torch.tensor([[1.0, 2.0, 3.0]])
     model = SimpleNamespace(
         _text_control_token_ids=torch.tensor([12, 13], dtype=torch.long),
+        _fused_audio_heads_ready=lambda: False,
         compute_channel_outputs=lambda hidden_states, forward_batch: [
             SimpleNamespace(next_token_logits=full_text_logits),
             SimpleNamespace(next_token_logits=audio_logits),
