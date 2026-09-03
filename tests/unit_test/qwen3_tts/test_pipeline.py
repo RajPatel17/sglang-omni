@@ -1892,6 +1892,62 @@ def test_qwen3_tts_streaming_vocoder_followup_graphs_can_be_disabled() -> None:
     assert scheduler._initial_decode_graphs is not scheduler._followup_decode_graphs
 
 
+class _StubSnakeBeta(torch.nn.Module):
+    """Stand-in with the qwen-tts SnakeBeta attribute layout."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.in_features = channels
+        self.alpha = torch.nn.Parameter(torch.randn(channels) * 0.1)
+        self.beta = torch.nn.Parameter(torch.randn(channels) * 0.1)
+        self.no_div_by_zero = 1e-9
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        alpha = torch.exp(self.alpha.unsqueeze(0).unsqueeze(-1))
+        beta = torch.exp(self.beta.unsqueeze(0).unsqueeze(-1))
+        return hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
+            torch.sin(hidden_states * alpha), 2
+        )
+
+
+_StubSnakeBeta.__name__ = "SnakeBeta"
+
+
+def test_qwen3_tts_fuse_vocoder_decoder_replaces_snake_beta_modules() -> None:
+    from sglang_omni.models.qwen3_tts.vocoder_kernels import (
+        FusedSnakeBeta,
+        fuse_vocoder_decoder,
+        fused_snake_beta,
+    )
+
+    torch.manual_seed(0)
+    decoder = torch.nn.Sequential(
+        torch.nn.Conv1d(4, 4, 1),
+        _StubSnakeBeta(4),
+        torch.nn.Sequential(_StubSnakeBeta(4)),
+    )
+    x = torch.randn(2, 4, 8)
+    expected = decoder(x)
+
+    assert fuse_vocoder_decoder(decoder) == 2
+    assert fuse_vocoder_decoder(decoder) == 0
+    assert isinstance(decoder[1], FusedSnakeBeta)
+    assert isinstance(decoder[2][0], FusedSnakeBeta)
+    assert torch.equal(decoder(x), expected)
+    assert fused_snake_beta(x, decoder[1].alpha, decoder[1].beta) is None
+
+
+def test_qwen3_tts_streaming_vocoder_fused_snake_activation_flag() -> None:
+    tokenizer = _FakeQwen3TTSTokenizer()
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device="cpu",
+        fused_snake_activation=True,
+    )
+
+    assert scheduler._decoder is tokenizer.model.decoder
+
+
 def test_qwen3_tts_vocoder_warms_graphs_before_serving_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1993,13 +2049,12 @@ def test_qwen3_tts_streaming_vocoder_default_initial_chunk_is_continuity_safe() 
         device="cpu",
     )
 
+    left = scheduler._stream_left_context_frames
+    # Startup prefix sums plus the steady jitter band left+1..left+stride.
+    expected = tuple(sorted({8} | {left + f for f in range(0, 9)}))
     assert scheduler.create_stream_state("request").initial_chunk_frames == 8
-    assert scheduler._initial_decode_graphs._input_frames == (
-        scheduler._stream_left_context_frames + 8,
-    )
-    assert scheduler._followup_decode_graphs._input_frames == (
-        scheduler._stream_left_context_frames + 8,
-    )
+    assert scheduler._initial_decode_graphs._input_frames == expected
+    assert scheduler._followup_decode_graphs._input_frames == expected
 
 
 def _qwen3_tts_stream_item(
@@ -2910,6 +2965,45 @@ def test_qwen3_tts_streaming_vocoder_chunk_ramp_schedules_early_chunks() -> None
     assert emitted_frames == [2, 4, 8, 8], "past the ramp the steady stride rules"
 
 
+def test_decode_graph_frame_counts_cover_startup_and_steady() -> None:
+    from sglang_omni.models.qwen3_tts.streaming_vocoder import (
+        _decode_graph_frame_counts,
+    )
+
+    counts = _decode_graph_frame_counts(
+        left_context=16,
+        initial_chunk_frames=2,
+        followup_stride_ramp=(4, 8),
+        steady_stride=8,
+    )
+    # Startup prefix sums 2, 2+4=6, 6+8=14, capped; steady band 17..24.
+    assert counts == (2, 6, 14, 17, 18, 19, 20, 21, 22, 23, 24)
+    # Every steady fresh-frame count from 1..stride is covered.
+    assert all((16 + f) in counts for f in range(1, 9))
+    # Non-positive strides are ignored, no zero window is captured.
+    assert 0 not in counts
+    assert _decode_graph_frame_counts(
+        left_context=16,
+        initial_chunk_frames=8,
+        followup_stride_ramp=(),
+        steady_stride=8,
+    ) == (8, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    # A stride wider than the steady stride still saturates at left_context +
+    # that stride, so its full-context window has to stay captured.
+    assert 32 in _decode_graph_frame_counts(
+        left_context=16,
+        initial_chunk_frames=16,
+        followup_stride_ramp=(),
+        steady_stride=8,
+    )
+    assert 32 in _decode_graph_frame_counts(
+        left_context=16,
+        initial_chunk_frames=8,
+        followup_stride_ramp=(16,),
+        steady_stride=8,
+    )
+
+
 def test_qwen3_tts_streaming_vocoder_chunk_ramp_covers_graph_shapes() -> None:
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
@@ -2917,8 +3011,10 @@ def test_qwen3_tts_streaming_vocoder_chunk_ramp_covers_graph_shapes() -> None:
         stream_chunk_ramp=(2, 4, 8),
     )
     left = scheduler._stream_left_context_frames
-    assert scheduler._initial_decode_graphs._input_frames == (left + 2,)
-    assert scheduler._followup_decode_graphs._input_frames == (left + 4, left + 8)
+    # Startup prefix sums {2, 6, 14} plus the steady jitter band left+1..left+8.
+    expected = tuple(sorted({2, 6, 14} | {left + f for f in range(1, 9)}))
+    assert scheduler._initial_decode_graphs._input_frames == expected
+    assert scheduler._followup_decode_graphs._input_frames == expected
 
     payload = make_payload(inputs="target", params={"stream": True})
     scheduler._on_streaming_new_request(payload.request_id, payload)
