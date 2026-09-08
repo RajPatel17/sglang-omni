@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=b617ff6d"></script>
+    <script src="../_static/documentation_options.js?v=23027dbc"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -57,11 +57,11 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Benchmark Relay" href="../benchmarks/relay.html" />
-    <link rel="prev" title="Omni Router Usage" href="omni_router.html" />
+    <link rel="prev" title="SGLang-Omni Rust Router" href="omni_router.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.3" />
-    <meta name="docbuild:last-update" content="Aug 30, 2026"/>
+  <meta name="docsearch:version" content="0.1.4" />
+    <meta name="docbuild:last-update" content="Sep 08, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -207,7 +207,9 @@
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_npu.html">Installation — Ascend NPU</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">🚀 Installation — Intel XPU</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_cpu.html">🚀 Installation — Intel CPU</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="nav bd-sidenav">
@@ -235,9 +237,10 @@
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Omni Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="audio_translations.html">Audio Translations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="process_topology.html">Process Topology, Replicas, and GPU Sharing</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts_process_topology.html">TTS Process Topology</a></li>
 <li class="toctree-l1"><a class="reference internal" href="process_topology_migration.html">Process Topology Migration</a></li>
-<li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="omni_router.html">SGLang-Omni Rust Router</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Same-GPU Data Parallelism with CUDA MPS</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
@@ -490,6 +493,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-runtime-support-mps">Native runtime support (<code class="docutils literal notranslate"><span class="pre">--mps</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy">Deploy</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#shared-weights-across-replicas-opt-in-default-off">Shared weights across replicas (opt-in, default off)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#how-we-found-this">How We Found This</a></li>
@@ -520,6 +524,97 @@
 <p>A common data-parallel deployment assigns one GPU to each replica. When a tuned replica still leaves substantial GPU headroom, colocating multiple replicas on the same GPU can improve per-GPU throughput.</p>
 <p>Same-GPU data parallelism runs several complete serving replicas on one GPU and lets <a class="reference external" href="https://docs.nvidia.com/deploy/mps/index.html">CUDA MPS</a> share the GPU between them. This is a conditional and ongoing optimization. We are excited to share it and call for the community to join the exploration.</p>
 <p><img alt="Multiple host chains plus CUDA MPS filling the idle GPU" src="../_images/same-gpu-dp-mps.svg" /></p>
+<section id="native-runtime-support-mps">
+<h2>Native runtime support (<code class="docutils literal notranslate"><span class="pre">--mps</span></code>)<a class="headerlink" href="#native-runtime-support-mps" title="Link to this heading">#</a></h2>
+<p>The runtime can manage MPS itself for the processes of <strong>one pipeline</strong>. When a
+pipeline colocates two or more single-GPU stage processes on one GPU (for
+example a frontend process next to the generation process, or process-level
+replicas), pass <code class="docutils literal notranslate"><span class="pre">--mps</span> <span class="pre">auto</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--mps<span class="w"> </span>auto
+</pre></div>
+</div>
+<p>Modes (<code class="docutils literal notranslate"><span class="pre">--mps</span></code> on the CLI or <code class="docutils literal notranslate"><span class="pre">mps:</span></code> in the pipeline config; default <code class="docutils literal notranslate"><span class="pre">off</span></code>):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">off</span></code>: MPS is never touched.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">auto</span></code>: MPS is enabled on every GPU that hosts two or more single-GPU,
+non-TP CUDA processes of this pipeline. GPUs with one process and TP groups
+run without MPS.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">on</span></code>: a single eligible process is enough, and an MPS-incapable platform is
+a hard error instead of a warning. Use <code class="docutils literal notranslate"><span class="pre">on</span></code> for same-GPU data parallelism:
+every <code class="docutils literal notranslate"><span class="pre">serve</span> <span class="pre">--mps</span> <span class="pre">on</span></code> on one GPU joins the same daemon.</p></li>
+</ul>
+<p>Both <code class="docutils literal notranslate"><span class="pre">auto</span></code> and <code class="docutils literal notranslate"><span class="pre">on</span></code> reject startup before acquiring MPS state when one process’s
+resolved placement spans more than one physical GPU; use <code class="docutils literal notranslate"><span class="pre">mps=off</span></code> for that
+placement. Factory CUDA devices use the narrowed worker’s local namespace:
+<code class="docutils literal notranslate"><span class="pre">cuda:0</span></code> is compatible with any single-GPU placement, while a nonzero <code class="docutils literal notranslate"><span class="pre">cuda:N</span></code>
+is excluded because narrowing a worker to one UUID makes its only valid CUDA
+ordinal <code class="docutils literal notranslate"><span class="pre">cuda:0</span></code>.
+Pipeline-edge transport remains the responsibility of the existing router and
+relay layers; it does not participate in MPS eligibility.</p>
+<p>The daemon is shared per physical GPU (keyed by device UUID): MPS merges
+kernels only for clients of one server, so the first serve creates the
+daemon, later serves join it, and the last one to leave drains the clients
+and quits it. Logical GPU ordinals are resolved once against the parent
+process’s CUDA visibility and then grouped by physical UUID; <code class="docutils literal notranslate"><span class="pre">auto</span></code> counts the
+combined client processes in each physical group. Pipeline or stage
+environment defaults must not override <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> or
+<code class="docutils literal notranslate"><span class="pre">CUDA_DEVICE_ORDER</span></code> while native MPS is enabled; set them on the parent command
+instead, or use <code class="docutils literal notranslate"><span class="pre">mps=off</span></code>. Same-GPU DP is therefore just N serve commands:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--mps<span class="w"> </span>on<span class="w"> </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.35<span class="w"> </span>--port<span class="w"> </span><span class="m">8807</span>
+sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>&lt;model&gt;<span class="w"> </span>--mps<span class="w"> </span>on<span class="w"> </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.35<span class="w"> </span>--port<span class="w"> </span><span class="m">8808</span>
+</pre></div>
+</div>
+<p>Start replicas one after another and give each an explicit memory budget
+(<code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> or the stage-qualified
+<code class="docutils literal notranslate"><span class="pre">--&lt;engine-stage&gt;.engine.max_total_tokens</span></code>), for the same KV-sizing
+reasons described under the script recipe below. Route traffic with the
+<a class="reference internal" href="omni_router.html"><span class="std std-doc">Omni Router</span></a>.</p>
+<p>Process-level replicas can size their pools in bytes instead, with
+<code class="docutils literal notranslate"><span class="pre">engine.kv_cache_bytes</span></code> per stage and <code class="docutils literal notranslate"><span class="pre">total_reserve_bytes</span></code> for the replica’s
+full footprint. The budgets are then checked against the card before any
+replica is spawned: colocation requires a declared footprint, the summed
+reserves and fractions must fit the card, and the summed KV pools alone must
+too. <code class="docutils literal notranslate"><span class="pre">engine.kv_cache_bytes</span></code> and <code class="docutils literal notranslate"><span class="pre">engine.max_total_tokens</span></code> are mutually
+exclusive on one stage, since the lower token cap would silently shrink the
+byte-derived pool.</p>
+<p>The runtime owns the full lifecycle. Every managed process is verified against
+the daemon’s client list before serving starts, because a process that misses
+the pipe directory silently falls back to time slicing. A watchdog fails the
+pipeline if daemon identity or control access is lost mid-serving. Shutdown
+re-evaluates the current client list, drains this serve’s clients, and quits the
+daemon only when no other serve still owns it.</p>
+<p>If a managed worker does not exit before the shutdown timeout, the runtime
+terminates that directly owned child process and reaps it before the launcher
+exits, even when that directly owned worker is also an MPS client. It sends no
+additional signal based on an MPS snapshot or client PID, and never
+automatically signals the daemon, an unknown descendant, or a GPU-wide process
+set. Process ownership and shared MPS state are handled independently: if
+daemon identity, client ownership, or control state cannot be proved after the
+workers are gone, the owner file is marked <code class="docutils literal notranslate"><span class="pre">retained</span></code>, its lock is released,
+and the state directory is preserved. The current command then exits with a
+detailed non-zero error instead of keeping a CLI owner alive.</p>
+<p>Dirty state is never repaired automatically. A join requires the native
+<code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control.pid</span></code> identity, a responsive control socket, and every
+published owner lease to still be held. After a hard kill (SIGKILL, OOM kill,
+node crash), even an idle daemon or one dead co-owner makes the next start
+preserve the state and fail with owner/client details and safe cleanup guidance.
+An unlocked or retained owner blocks every later start until an operator has
+inspected and cleaned the state. Existing healthy co-owners keep serving, but
+new owners cannot join and no process retries cleanup automatically. Clean up
+and start again. A normal shutdown leaves nothing behind.</p>
+<p>Operator notes: state lives under <code class="docutils literal notranslate"><span class="pre">/tmp/sglang-omni-mps-&lt;user&gt;/&lt;gpu-uuid&gt;/</span></code>
+(<code class="docutils literal notranslate"><span class="pre">SGLANG_OMNI_MPS_STATE_ROOT</span></code> overrides it). Serves that are meant to share
+one GPU must use the same state root, or they cannot discover each other’s
+daemon and will run separate MPS servers that time-slice against each other.
+The state root is created with mode <code class="docutils literal notranslate"><span class="pre">0700</span></code>; an existing root must already be a
+non-symlink directory owned by the current user with that mode. Native MPS
+rejects <code class="docutils literal notranslate"><span class="pre">CUDA_MPS_PIPE_DIRECTORY</span></code> in the parent, pipeline, or stage environment
+instead of overwriting or joining an external daemon. It likewise rejects
+<code class="docutils literal notranslate"><span class="pre">SGLANG_OMNI_WEIGHT_SHARE</span></code> in those locations: inside one pipeline, CUDA IPC
+weight sharing is requested with <code class="docutils literal notranslate"><span class="pre">--weight-share</span> <span class="pre">on</span></code> and the runtime assigns
+replica roles itself, while the <code class="docutils literal notranslate"><span class="pre">examples/mps_dp/launch.sh</span></code> recipe below sets
+that variable for its own separate serve processes.</p>
+</section>
 <section id="deploy">
 <h2>Deploy<a class="headerlink" href="#deploy" title="Link to this heading">#</a></h2>
 <p>The steps below are one continuous flow. We provide <code class="docutils literal notranslate"><span class="pre">examples/mps_dp/launch.sh</span></code> to manage the private MPS daemon and serving replicas for one run. It records replica processes, ports, and logs, starts replicas sequentially, verifies their KV capacity and MPS attachment, and tears down only the run it recorded. Detailed instructions are as follows:</p>
@@ -549,7 +644,12 @@ numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span
 <p>Both profiles set <code class="docutils literal notranslate"><span class="pre">mem_fraction_static</span></code> to <code class="docutils literal notranslate"><span class="pre">0.85</span></code>; <code class="docutils literal notranslate"><span class="pre">MF</span></code> can override it. When <code class="docutils literal notranslate"><span class="pre">CONFIG</span></code> is unset, the existing <code class="docutils literal notranslate"><span class="pre">MODEL</span></code> and <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code> interface remains available. Launching replicas sequentially avoids overlapping memory profiling and CUDA-graph capture during startup.</p>
 <p>Identical <code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> flags do <strong>not</strong> mean identical KV capacity. <code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> budgets model weights and the KV pool against the GPU memory available when each replica starts. Roughly, the profiled KV memory is the requested fraction of free memory measured before model loading, minus model and fixed runtime allocations. It is a per-replica budget, not an additive share of the card. Because replicas start sequentially, earlier ones have already reserved memory, so later ones see a smaller free pool and allocate fewer KV tokens even when every flag is the same (in one run, three sequential <code class="docutils literal notranslate"><span class="pre">mf=0.27</span></code> replicas received 97,503 / 53,149 / 20,961 KV tokens).</p>
 <p><img alt="What same-GPU DP spends in VRAM and what it reclaims" src="../_images/same-gpu-dp-vram.svg" /></p>
-<p>Memory profiling does not coordinate KV allocation across independent replica processes. For <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, the launcher therefore requires one common <code class="docutils literal notranslate"><span class="pre">max_total_tokens</span></code> value, either from the pipeline config or from <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code>. SGLang treats this value as an upper bound; the launcher rejects startup unless every replica resolves exactly that capacity. The cap applies independently to each replica; it is not divided across the pool. It is also independent of the request-level <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> limit and does not distribute requests between replicas.</p>
+<p>Memory profiling does not coordinate KV allocation across independent replica processes. For <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, every replica must resolve the same KV capacity, which can come from either sizing knob but never both:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">engine.kv_cache_bytes</span></code> in the pipeline config sizes every replica’s pool deterministically; the launcher verifies all replicas resolved the same capacity and rejects a simultaneous <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code>, since a lower token cap would silently shrink the byte-derived pool.</p></li>
+<li><p>Without a byte budget, the launcher requires one common <code class="docutils literal notranslate"><span class="pre">max_total_tokens</span></code> value, from the pipeline config or from <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code>, and rejects startup unless every replica resolves exactly that capacity.</p></li>
+</ul>
+<p>Either cap applies independently to each replica; it is not divided across the pool. It is also independent of the request-level <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> limit and does not distribute requests between replicas.</p>
 <p>The H100 Higgs DP3 profile uses <code class="docutils literal notranslate"><span class="pre">100000</span></code> tokens per replica. The H200 Higgs DP8 profile uses <code class="docutils literal notranslate"><span class="pre">30000</span></code> tokens per replica, preserving GPU memory headroom for non-KV runtime allocations, including the colocated audio encoder and vocoder. These values are specific to their configurations, not universal hardware defaults. Recalculate the cap after changing the model, GPU, runtime, replica count, memory settings, or CUDA-graph settings. If a replica cannot allocate the common cap, lower it or reduce the replica count.</p>
 <p>The H200 profile’s <code class="docutils literal notranslate"><span class="pre">30000</span></code>-token KV pool is smaller than the worst-case demand from 64 requests each generating up to 2048 new tokens, even before accounting for input tokens. Therefore, <code class="docutils literal notranslate"><span class="pre">max_running_requests=64</span></code> is an admission ceiling rather than a guarantee that 64 long requests can decode concurrently. If the pool fills, SGLang retracts requests and returns them to the waiting queue until KV capacity becomes available.</p>
 <ol class="arabic simple" start="3">
@@ -563,7 +663,7 @@ numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span
 <ol class="arabic simple" start="5">
 <li><p><strong>Route traffic.</strong></p></li>
 </ol>
-<p>For easy deployment, you can register each replica endpoint with the <a class="reference internal" href="omni_router.html"><span class="std std-doc">Omni Router</span></a>. Keep the router’s <code class="docutils literal notranslate"><span class="pre">--max-connections</span></code> at least as large as the total offered concurrency. The case study did not benchmark router scheduling policies, so confirm that the selected policy keeps every replica driven and meets your workload’s latency and throughput requirements.</p>
+<p>For easy deployment, you can register each replica endpoint with the <a class="reference internal" href="python_router.html"><span class="std std-doc">Python Router</span></a>. Keep the router’s <code class="docutils literal notranslate"><span class="pre">--max-connections</span></code> at least as large as the total offered concurrency. The case study did not benchmark router scheduling policies, so confirm that the selected policy keeps every replica driven and meets your workload’s latency and throughput requirements.</p>
 <ol class="arabic simple" start="6">
 <li><p><strong>Tear down safely.</strong></p></li>
 </ol>
@@ -601,6 +701,9 @@ numactl<span class="w"> </span>-H<span class="w"> </span><span class="p">|</span
 <section id="shared-weights-across-replicas-opt-in-default-off">
 <h2>Shared weights across replicas (opt-in, default off)<a class="headerlink" href="#shared-weights-across-replicas-opt-in-default-off" title="Link to this heading">#</a></h2>
 <p>By default every replica loads its own full copy of the AR backbone (7.60 GiB for Higgs 3-4B — about a third of a DP3 footprint). Since all replicas run the same read-only weights on the same GPU, the launcher can instead share <strong>one</strong> copy over CUDA IPC:</p>
+<blockquote>
+<div><p>If your replicas live inside one pipeline (<code class="docutils literal notranslate"><span class="pre">processes.&lt;name&gt;.num_replicas</span></code> with a repeated <code class="docutils literal notranslate"><span class="pre">replica_devices</span></code> entry), prefer <code class="docutils literal notranslate"><span class="pre">sgl-omni</span> <span class="pre">serve</span> <span class="pre">--weight-share</span> <span class="pre">on</span></code>: the runtime assigns leader and follower roles, orders startup and shutdown around them, and needs no environment variable. See <a class="reference internal" href="process_topology.html"><span class="std std-doc">Process Topology, Replicas, and GPU Sharing</span></a>. The <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> recipe below covers the other shape, several independent <code class="docutils literal notranslate"><span class="pre">serve</span></code> processes supervised by the script; the architecture support table applies to both.</p>
+</div></blockquote>
 <p><strong>Scope and contract.</strong> This is opt-in (<code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code>, default off) and gated to <strong>validated architectures with tp=pp=1</strong>; anything else is rejected before any resource is created, because a model that writes per-request state into a shared parameter would corrupt co-located replicas. An architecture audit alone does not enable sharing: a model is supported only after the documented launcher command passed end-to-end validation (shared N=2 boot under MPS, health, attach verification, concurrent-request correctness, clean teardown) at the current revision. <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> requires <code class="docutils literal notranslate"><span class="pre">CONFIG</span></code>, so the supported-config check runs in preflight, before the MPS daemon, state directory, or any replica exists. Each supported architecture carries a share policy: registered tensors the model writes at serving time (per-step decode staging scratch) are classified <strong>replica-private</strong> — every replica keeps its own storage for them and only the immutable weights alias one storage. Leader and follower derive the classification from the same policy and fail closed on any disagreement (it is part of the manifest). Sharing is a whole-group lifecycle: the leader must outlive followers, restart the whole run together (never a single replica), online weight updates are refused while sharing is active, and each follower requires an explicit <code class="docutils literal notranslate"><span class="pre">MAX_TOTAL_TOKENS</span></code> (its dummy weights are freed before KV profiling, so KV sizing must be pinned). <code class="docutils literal notranslate"><span class="pre">autodp.sh</span></code> sizes a <strong>maximum <em>estimated</em></strong> DP (boot-validated), not an absolute safe maximum; because its sizing assumes sharing, it defaults <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code>, while <code class="docutils literal notranslate"><span class="pre">launch.sh</span></code> itself defaults off.</p>
 <p>A model is either <strong>supported</strong> or <strong>not supported</strong>; there is no intermediate tier. Supported means all of the following passed at the current revision, with commands and logs recorded in the PR: the documented <code class="docutils literal notranslate"><span class="pre">launch.sh</span></code> command boots <code class="docutils literal notranslate"><span class="pre">N=2</span></code> with <code class="docutils literal notranslate"><span class="pre">WEIGHT_SHARE=1</span></code> under a private MPS daemon, every replica passes its health check and MPS attach verification, the follower attaches the leader’s weights over CUDA IPC and holds no second resident copy of the shared weights after boot, concurrent requests across replicas return correct outputs (byte-identical audio to the single-replica baseline for TTS; word-identical transcripts for ASR, where timestamp fields may jitter under batching), and teardown leaves no replica process or MPS client behind. This is one-H100 end-to-end smoke validation — executable support evidence at the current revision, not a long-term stability or CI claim.</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -924,7 +1027,7 @@ nsys<span class="w"> </span>profile<span class="w"> </span>--gpu-metrics-devices
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Omni Router Usage</p>
+        <p class="prev-next-title">SGLang-Omni Rust Router</p>
       </div>
     </a>
     <a class="right-next"
@@ -954,6 +1057,7 @@ nsys<span class="w"> </span>profile<span class="w"> </span>--gpu-metrics-devices
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-runtime-support-mps">Native runtime support (<code class="docutils literal notranslate"><span class="pre">--mps</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy">Deploy</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#shared-weights-across-replicas-opt-in-default-off">Shared weights across replicas (opt-in, default off)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#how-we-found-this">How We Found This</a></li>
@@ -998,7 +1102,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 30, 2026.
+  Last updated on Sep 08, 2026.
   <br/>
 </p>
   </div>
